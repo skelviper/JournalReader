@@ -1,0 +1,24 @@
+{
+  "name": "journal-reader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron PDF reader for literature with annotation and citation figure popup",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:packages": "npm run --workspace @journal-reader/types build && npm run --workspace @journal-reader/parser build && npm run --workspace @journal-reader/storage build && npm run --workspace @journal-reader/pdf-core build && npm run --workspace @journal-reader/ui build",
+    "build": "npm run build:packages && npm run --workspace @journal-reader/desktop build",
+    "typecheck": "npm run --workspace @journal-reader/types typecheck && npm run --workspace @journal-reader/parser typecheck && npm run --workspace @journal-reader/storage typecheck && npm run --workspace @journal-reader/pdf-core typecheck && npm run --workspace @journal-reader/ui typecheck && npm run --workspace @journal-reader/desktop typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop build:main && npm run --workspace @journal-reader/desktop build:preload && npm run --workspace @journal-reader/desktop dev",
+    "rebuild:native": "npm run --workspace @journal-reader/desktop rebuild:native"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

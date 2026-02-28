@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src/renderer",
+    "outDir": "dist/renderer",
+    "jsx": "react-jsx",
+    "lib": ["ES2022", "DOM"],
+    "types": ["vite/client"]
+  },
+  "include": ["src/renderer"]
+}
