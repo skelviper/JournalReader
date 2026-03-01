@@ -175,6 +175,7 @@ export type JournalApi = {
   citationResolveByLabel: (docId: string, kind: TargetKind, label: string) => Promise<ResolveCitationResponse | null>;
   referenceResolve: (docId: string, page: number, x: number, y: number) => Promise<ResolveReferenceResponse | null>;
   referenceGetEntries: (docId: string, indices: number[]) => Promise<ReferenceEntry[]>;
+  referenceSearchByText: (docId: string, text: string, limit?: number) => Promise<ReferenceEntry[]>;
   referenceHasEntries: (docId: string) => Promise<boolean>;
   referenceOpenPopup: (payload: { indices: number[]; entries: ReferenceEntry[] }) => Promise<void>;
   figureGetTarget: (docId: string, targetId: string) => Promise<FigureTargetResponse>;

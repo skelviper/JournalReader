@@ -1,6 +1,6 @@
 import { app, ipcMain, BrowserWindow, dialog, shell } from "electron";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { extractCitations, extractCaptions, extractReferenceData, mapCitationsToTargets } from "@journal-reader/parser";
 import {
@@ -782,6 +782,10 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     return repo.getReferenceEntries(docId, indices);
   });
 
+  ipcMain.handle("reference.searchByText", (_event, docId: string, text: string, limit?: number) => {
+    return repo.searchReferenceEntries(docId, text, limit);
+  });
+
   ipcMain.handle("reference.hasEntries", (_event, docId: string) => {
     return repo.hasReferenceEntries(docId);
   });
@@ -805,7 +809,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     return repo.listTargetsByKindLabel(docId, kind, label);
   });
 
-  ipcMain.handle("figure.openPopup", (_event, payload: FigurePopupPayload) => {
+  ipcMain.handle("figure.openPopup", async (_event, payload: FigurePopupPayload) => {
     const popup = new BrowserWindow({
       width: 1080,
       height: 900,
@@ -1107,7 +1111,14 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     </script>
     </body></html>`;
 
-    void popup.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    const popupDir = join(app.getPath("temp"), "journal-reader-popups");
+    await mkdir(popupDir, { recursive: true });
+    const popupFile = join(popupDir, `figure-${Date.now()}-${randomUUID()}.html`);
+    await writeFile(popupFile, html, "utf-8");
+    popup.once("closed", () => {
+      void rm(popupFile, { force: true }).catch(() => undefined);
+    });
+    await popup.loadFile(popupFile);
   });
 
   ipcMain.handle("reference.openPopup", (_event, payload: { indices: number[]; entries: ReferenceEntry[] }) => {

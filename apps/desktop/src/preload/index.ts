@@ -37,6 +37,7 @@ const api: JournalApi = {
   citationResolveByLabel: (docId, kind, label) => ipcRenderer.invoke("citation.resolveByLabel", docId, kind, label),
   referenceResolve: (docId, page, x, y) => ipcRenderer.invoke("reference.resolve", docId, page, x, y),
   referenceGetEntries: (docId, indices) => ipcRenderer.invoke("reference.getEntries", docId, indices),
+  referenceSearchByText: (docId, text, limit) => ipcRenderer.invoke("reference.searchByText", docId, text, limit),
   referenceHasEntries: (docId) => ipcRenderer.invoke("reference.hasEntries", docId),
   referenceOpenPopup: (payload) => ipcRenderer.invoke("reference.openPopup", payload),
   figureGetTarget: (docId, targetId) => ipcRenderer.invoke("figure.getTarget", docId, targetId),

@@ -92,6 +92,10 @@ type PixelBox = {
 
 const MIN_SCALE = 0.8;
 const MAX_SCALE = 2.8;
+const PINCH_BASE_GAIN = 0.00155;
+const PINCH_MIN_ABS_DELTA = 0.05;
+const PINCH_MAX_REL_STEP = 0.065;
+const PINCH_SMOOTH_ALPHA = 0.45;
 const HIGHLIGHT_COLORS = [
   { label: "Yellow", value: "#fce588" },
   { label: "Green", value: "#b8f3b4" },
@@ -622,31 +626,30 @@ function expandRectWithinPage(rect: Rect, pageRect: Rect, pad: number): Rect {
 
 function buildDirectionalFallbackRect(pageRect: Rect, captionRect: Rect, kind: string): Rect {
   const marginX = Math.max(10, pageRect.w * (kind === "table" ? 0.06 : 0.04));
-  const topEdge = pageRect.y + 8;
-  const bottomEdge = pageRect.y + pageRect.h - 8;
-  const aboveTop = topEdge;
-  const aboveBottom = Math.max(topEdge + 40, Math.min(bottomEdge, captionRect.y - 8));
-  const belowTop = Math.min(bottomEdge - 40, Math.max(topEdge, captionRect.y + captionRect.h + 6));
-  const belowBottom = bottomEdge;
-  const aboveH = Math.max(1, aboveBottom - aboveTop);
-  const belowH = Math.max(1, belowBottom - belowTop);
+  const pageBottom = pageRect.y + 8;
+  const pageTop = pageRect.y + pageRect.h - 8;
+  const captionBottom = Math.max(pageBottom, captionRect.y);
+  const captionTop = Math.min(pageTop, captionRect.y + captionRect.h);
+  const gap = Math.max(8, captionRect.h * 0.35);
 
-  let y = aboveTop;
+  // PDF coordinates increase upward, so the "above caption" area starts at captionTop.
+  const aboveY = Math.min(pageTop - 1, captionTop + gap);
+  const aboveH = Math.max(1, pageTop - aboveY);
+  const belowY = pageBottom;
+  const belowH = Math.max(1, (captionBottom - gap) - pageBottom);
+
+  let y = aboveY;
   let h = aboveH;
   if (kind === "table") {
-    y = belowTop;
+    y = belowY;
     h = belowH;
-    if (h < pageRect.h * 0.2 && aboveH > h * 1.2) {
-      y = aboveTop;
+    if (h < pageRect.h * 0.16 && aboveH > h * 1.2) {
+      y = aboveY;
       h = aboveH;
     }
-  } else {
-    y = aboveTop;
-    h = aboveH;
-    if (h < pageRect.h * 0.2 && belowH > h * 1.2) {
-      y = belowTop;
-      h = belowH;
-    }
+  } else if (h < pageRect.h * 0.16 && belowH > h * 1.2) {
+    y = belowY;
+    h = belowH;
   }
 
   return expandRectWithinPage(
@@ -781,7 +784,12 @@ async function detectVisualRegionNearCaption(
   return { rect, mode: "component", area: rect.w * rect.h, score: best.score };
 }
 
-async function renderTargetCropImage(pdfDoc: PDFDocumentProxy, pageNumber: number, rect: Rect): Promise<string | null> {
+async function renderTargetCropImage(
+  pdfDoc: PDFDocumentProxy,
+  pageNumber: number,
+  rect: Rect,
+  options?: { trim?: boolean },
+): Promise<string | null> {
   const page = await pdfDoc.getPage(pageNumber);
   const viewport = page.getViewport({ scale: 3 });
   const fullCanvas = document.createElement("canvas");
@@ -810,6 +818,9 @@ async function renderTargetCropImage(pdfDoc: PDFDocumentProxy, pageNumber: numbe
   cropCanvas.width = sw;
   cropCanvas.height = sh;
   cropCtx.drawImage(fullCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  if (options?.trim === false) {
+    return cropCanvas.toDataURL("image/png");
+  }
   const image = cropCtx.getImageData(0, 0, sw, sh);
   let minX = sw;
   let minY = sh;
@@ -837,6 +848,14 @@ async function renderTargetCropImage(pdfDoc: PDFDocumentProxy, pageNumber: numbe
     return cropCanvas.toDataURL("image/png");
   }
 
+  const contentW = maxX - minX + 1;
+  const contentH = maxY - minY + 1;
+  const areaRatio = (contentW * contentH) / Math.max(1, sw * sh);
+  const tooThinContent = contentW < sw * 0.16 || contentH < sh * 0.16;
+  if (areaRatio < 0.04 || tooThinContent) {
+    return cropCanvas.toDataURL("image/png");
+  }
+
   const pad = Math.max(12, Math.floor(Math.max(sw, sh) * 0.02));
   const tx = Math.max(0, minX - pad);
   const ty = Math.max(0, minY - pad);
@@ -859,6 +878,12 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   const selectionMenuRef = useRef<HTMLDivElement | null>(null);
   const highlightMenuRef = useRef<HTMLDivElement | null>(null);
   const scaleRef = useRef(1.3);
+  const pendingScrollRef = useRef<{ left: number; top: number } | null>(null);
+  const scrollApplyRafRef = useRef<number | null>(null);
+  const pinchZoomRafRef = useRef<number | null>(null);
+  const pinchAccumulatedDeltaRef = useRef(0);
+  const pinchSmoothedDeltaRef = useRef(0);
+  const pinchPointerRef = useRef({ x: 0, y: 0 });
   const selectionActionSeqRef = useRef(0);
   const [docId, setDocId] = useState<string | null>(null);
   const [docTitle, setDocTitle] = useState("No document loaded");
@@ -881,6 +906,19 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   useEffect(() => {
     scaleRef.current = scale;
   }, [scale]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollApplyRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollApplyRafRef.current);
+        scrollApplyRafRef.current = null;
+      }
+      if (pinchZoomRafRef.current !== null) {
+        window.cancelAnimationFrame(pinchZoomRafRef.current);
+        pinchZoomRafRef.current = null;
+      }
+    };
+  }, []);
 
   const pageNumbers = useMemo(() => {
     if (!pdfDoc) {
@@ -992,18 +1030,29 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       const offsetX = clientX - rect.left;
       const offsetY = clientY - rect.top;
       const ratio = targetScale / currentScale;
-      const nextScrollLeft = (reader.scrollLeft + offsetX) * ratio - offsetX;
-      const nextScrollTop = (reader.scrollTop + offsetY) * ratio - offsetY;
+      const baseScrollLeft = pendingScrollRef.current?.left ?? reader.scrollLeft;
+      const baseScrollTop = pendingScrollRef.current?.top ?? reader.scrollTop;
+      const nextScrollLeft = (baseScrollLeft + offsetX) * ratio - offsetX;
+      const nextScrollTop = (baseScrollTop + offsetY) * ratio - offsetY;
 
       scaleRef.current = targetScale;
+      pendingScrollRef.current = { left: nextScrollLeft, top: nextScrollTop };
       setScale(targetScale);
-      window.requestAnimationFrame(() => {
+      if (scrollApplyRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollApplyRafRef.current);
+      }
+      scrollApplyRafRef.current = window.requestAnimationFrame(() => {
+        scrollApplyRafRef.current = null;
         const container = readerRef.current;
+        const pendingScroll = pendingScrollRef.current;
         if (!container) {
           return;
         }
-        container.scrollLeft = nextScrollLeft;
-        container.scrollTop = nextScrollTop;
+        if (!pendingScroll) {
+          return;
+        }
+        container.scrollLeft = pendingScroll.left;
+        container.scrollTop = pendingScroll.top;
       });
     }, []);
 
@@ -1013,11 +1062,34 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     }
     event.preventDefault();
     event.stopPropagation();
+    pinchAccumulatedDeltaRef.current += event.deltaY;
+    pinchPointerRef.current = { x: event.clientX, y: event.clientY };
 
-    const currentScale = scaleRef.current;
-    const zoomFactor = Math.exp(-event.deltaY * 0.0025);
-    const nextScale = clampScale(currentScale * zoomFactor);
-    setScaleAroundPointer(nextScale, event.clientX, event.clientY);
+    if (pinchZoomRafRef.current !== null) {
+      return;
+    }
+
+    pinchZoomRafRef.current = window.requestAnimationFrame(() => {
+      pinchZoomRafRef.current = null;
+      const rawDeltaY = pinchAccumulatedDeltaRef.current;
+      pinchAccumulatedDeltaRef.current = 0;
+      const prevSmoothed = pinchSmoothedDeltaRef.current;
+      const smoothedDeltaY = prevSmoothed + (rawDeltaY - prevSmoothed) * PINCH_SMOOTH_ALPHA;
+      pinchSmoothedDeltaRef.current = smoothedDeltaY * 0.92;
+
+      if (Math.abs(smoothedDeltaY) < PINCH_MIN_ABS_DELTA) {
+        return;
+      }
+
+      const currentScale = scaleRef.current;
+      const adaptiveGain = Math.max(0.0012, Math.min(0.00185, PINCH_BASE_GAIN - (currentScale - 1.3) * 0.0001));
+      const zoomFactor = Math.exp(-smoothedDeltaY * adaptiveGain);
+      const idealScale = currentScale * zoomFactor;
+      const maxStep = Math.max(0.01, currentScale * PINCH_MAX_REL_STEP);
+      const clampedStep = Math.max(-maxStep, Math.min(maxStep, idealScale - currentScale));
+      const nextScale = clampScale(currentScale + clampedStep);
+      setScaleAroundPointer(nextScale, pinchPointerRef.current.x, pinchPointerRef.current.y);
+    });
   }
 
   const openPdfFromPath = useCallback(
@@ -1240,7 +1312,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     const target = chosen.id === resolved.targetId ? fallbackTarget : await api.figureGetTarget(docId, chosen.id);
     let imageDataUrl = target.imageDataUrl;
     if (pdfDoc) {
-      const rendered = await renderTargetCropImage(pdfDoc, chosen.page, chosenCropRect).catch(() => null);
+      const rendered = await renderTargetCropImage(pdfDoc, chosen.page, chosenCropRect, {
+        trim: chosenDetectionMode === "component",
+      }).catch(() => null);
       if (rendered) {
         imageDataUrl = rendered;
       }
@@ -1359,27 +1433,28 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     try {
       setErrorText("");
       const indices = extractReferenceIndices(selectionMenu.text);
-      if (indices.length === 0) {
-        setStatusText("No reference index recognized in selected text");
-        setErrorText("Select text like 16,17,21,23 or [2,4-5], then choose Open Reference.");
-        setSelectionMenu(null);
-        return;
+      let entries = indices.length > 0 ? await api.referenceGetEntries(docId, indices) : [];
+      if (entries.length === 0) {
+        entries = await api.referenceSearchByText(docId, selectionMenu.text, 12);
       }
-
-      const entries = await api.referenceGetEntries(docId, indices);
+      const resolvedIndices = entries.map((entry) => entry.index);
       if (entries.length === 0) {
         const hasAny = await api.referenceHasEntries(docId);
         if (!hasAny) {
           setStatusText("No reference list detected in this PDF");
-          setErrorText("This PDF appears to contain in-text citation numbers, but no parsable reference list section.");
+          setErrorText("No parsable reference list was detected in this PDF.");
         } else {
-          setStatusText(`No entries found for references ${indices.join(", ")}`);
-          setErrorText("Reference list exists, but selected indices were not found. Try selecting a full marker.");
+          setStatusText("No matched references found for selected text");
+          setErrorText("Try selecting a full citation marker like '16,17' or '(Tan et al., 2018)'.");
         }
       } else {
-        setStatusText(`Opened references ${indices.join(", ")}`);
+        if (indices.length > 0) {
+          setStatusText(`Opened references ${resolvedIndices.join(", ")}`);
+        } else {
+          setStatusText(`Opened ${entries.length} matched references`);
+        }
       }
-      await api.referenceOpenPopup({ indices, entries });
+      await api.referenceOpenPopup({ indices: resolvedIndices, entries });
       setSelectionMenu(null);
     } catch (error) {
       setStatusText("Failed to open references from selection");

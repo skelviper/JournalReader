@@ -72,6 +72,32 @@ function baseLabel(label: string): string {
   return match ? match[1] : normalized;
 }
 
+function normalizeRefSnippet(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function extractReferenceYears(text: string): string[] {
+  return [...text.matchAll(/\b(?:19|20)\d{2}\b/g)].map((match) => match[0]).filter((item): item is string => !!item);
+}
+
+function extractReferenceSurnames(text: string): string[] {
+  const out = new Set<string>();
+  const patterns = [
+    /([A-Z][A-Za-z'’\-]{1,40})\s+et\s+al\./g,
+    /([A-Z][A-Za-z'’\-]{1,40})\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40}/g,
+    /([A-Z][A-Za-z'’\-]{1,40}),\s*\b(?:19|20)\d{2}\b/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const surname = match[1]?.toLowerCase();
+      if (surname && surname.length >= 2) {
+        out.add(surname);
+      }
+    }
+  }
+  return [...out];
+}
+
 export class StorageRepository {
   private readonly db: Database.Database;
 
@@ -526,6 +552,73 @@ export class StorageRepository {
       .all(docId, ...uniq) as ReferenceEntryRow[];
 
     return rows.map((row) => ({
+      docId: row.doc_id,
+      index: row.ref_index,
+      text: row.text,
+      page: row.page,
+    }));
+  }
+
+  searchReferenceEntries(docId: string, rawQuery: string, limit = 12): ReferenceEntry[] {
+    const query = normalizeRefSnippet(rawQuery);
+    if (!query) {
+      return [];
+    }
+    const years = extractReferenceYears(query);
+    const surnames = extractReferenceSurnames(query);
+    const fallbackTokens = query
+      .toLowerCase()
+      .split(/[^a-z0-9]+/i)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 4)
+      .slice(0, 8);
+
+    const rows = this.db
+      .prepare(
+        `SELECT doc_id, ref_index, text, page
+         FROM reference_entries
+         WHERE doc_id = ?
+         ORDER BY ref_index ASC`,
+      )
+      .all(docId) as ReferenceEntryRow[];
+
+    const scored = rows
+      .map((row) => {
+        const lower = row.text.toLowerCase();
+        let score = 0;
+        for (const year of years) {
+          if (lower.includes(year)) {
+            score += 12;
+          }
+        }
+        for (const surname of surnames) {
+          if (new RegExp(`\\b${surname},`, "i").test(row.text)) {
+            score += 10;
+            continue;
+          }
+          if (new RegExp(`\\b${surname}\\b`, "i").test(row.text)) {
+            score += 6;
+          }
+        }
+        if (score === 0 && years.length === 0 && surnames.length === 0) {
+          for (const token of fallbackTokens) {
+            if (lower.includes(token)) {
+              score += 1;
+            }
+          }
+        }
+        return { row, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => {
+        if (a.score !== b.score) {
+          return b.score - a.score;
+        }
+        return a.row.ref_index - b.row.ref_index;
+      })
+      .slice(0, Math.max(1, Math.min(30, limit)));
+
+    return scored.map(({ row }) => ({
       docId: row.doc_id,
       index: row.ref_index,
       text: row.text,

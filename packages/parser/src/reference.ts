@@ -25,6 +25,9 @@ const BRACKET_ENTRY_PATTERN = /^\s*\[(\d{1,4})\]\s*(.*)$/;
 const NUMBERED_ENTRY_PATTERN = /^\s*(\d{1,4})[.)]\s*(.*)$/;
 const LOOSE_NUMBERED_ENTRY_PATTERN = /^\s*(\d{1,4})\s+(.+)$/;
 const REFERENCES_HEADER_PATTERN = /^\s*(reference|references|bibliography|literature cited|works cited)\b/i;
+const AUTHOR_YEAR_GROUP_PATTERN = /\(([^()]{4,260})\)/g;
+const INLINE_AUTHOR_YEAR_PATTERN =
+  /([A-Z][A-Za-z'’\-]{1,40}(?:\s+et\s+al\.)?|[A-Z][A-Za-z'’\-]{1,40}\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40}),\s*((?:19|20)\d{2}[a-z]?(?:\s*,\s*(?:19|20)\d{2}[a-z]?)*)/g;
 
 function normalizeSpaces(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -409,6 +412,24 @@ function parseEntryStartsInLine(text: string): Array<{ index: number; body: stri
   return [];
 }
 
+function densePrefixLength(indices: number[]): number {
+  if (indices.length === 0) {
+    return 0;
+  }
+  const uniqSorted = [...new Set(indices)].sort((a, b) => a - b);
+  let prefix = 0;
+  for (const idx of uniqSorted) {
+    if (idx === prefix + 1) {
+      prefix = idx;
+      continue;
+    }
+    if (idx > prefix + 1) {
+      break;
+    }
+  }
+  return prefix;
+}
+
 function guessReferencesStartByCandidates(lines: LineEntry[]): number {
   if (lines.length === 0) {
     return -1;
@@ -539,6 +560,353 @@ function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: 
   return [...byIndex.values()].sort((a, b) => a.index - b.index);
 }
 
+function normalizeYear(yearRaw: string): string {
+  return yearRaw.replace(/[^\d]/g, "");
+}
+
+function looksLikeAuthorYearStart(text: string): boolean {
+  const normalized = normalizeEntryLeadNoise(text);
+  if (!normalized || REFERENCES_HEADER_PATTERN.test(normalized)) {
+    return false;
+  }
+  if (/^(received|revised|accepted|published):/i.test(normalized)) {
+    return false;
+  }
+  if (/^https?:\/\//i.test(normalized) || /^doi[:\s]/i.test(normalized)) {
+    return false;
+  }
+  if (/^\d{1,4}[.)]\s+/.test(normalized) || /^\[\d{1,4}\]/.test(normalized)) {
+    return false;
+  }
+  const yearMatch = normalized.match(/\((?:19|20)\d{2}[a-z]?\)/i);
+  if (!yearMatch || typeof yearMatch.index !== "number") {
+    return false;
+  }
+
+  const head = normalized.slice(0, yearMatch.index).trim();
+  if (head.length < 6 || head.length > 140) {
+    return false;
+  }
+
+  if (/^[A-Z][A-Za-z'’\-]{1,40},\s+/.test(head)) {
+    return true;
+  }
+  if (/^[A-Z][A-Za-z'’\-]{1,40}\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40},\s+/.test(head)) {
+    return true;
+  }
+  if (/consortium/i.test(head) && /^[A-Za-z0-9'’\-;,&.\s]+$/.test(head)) {
+    return true;
+  }
+  return false;
+}
+
+function isLikelyReferenceFooter(text: string): boolean {
+  const normalized = normalizeEntryLeadNoise(text);
+  if (!normalized) {
+    return false;
+  }
+  if (/^Cell\s+\d+\b/i.test(normalized)) {
+    return true;
+  }
+  if (/^Supplemental Information\b/i.test(normalized)) {
+    return true;
+  }
+  if (/^https?:\/\/doi\.org\/10\./i.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function reorderLinesByPageColumn(lines: LineEntry[]): LineEntry[] {
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const byPage = new Map<number, LineEntry[]>();
+  for (const line of lines) {
+    const list = byPage.get(line.page) ?? [];
+    list.push(line);
+    byPage.set(line.page, list);
+  }
+
+  const pages = [...byPage.keys()].sort((a, b) => a - b);
+  const out: LineEntry[] = [];
+  for (const page of pages) {
+    const pageLines = (byPage.get(page) ?? []).sort((a, b) => b.y - a.y);
+    if (pageLines.length < 12) {
+      out.push(...pageLines);
+      continue;
+    }
+
+    const centers = pageLines
+      .map((line) => line.bbox.x + line.bbox.w / 2)
+      .sort((a, b) => a - b);
+    let bestGap = 0;
+    let splitIndex = -1;
+    for (let i = 1; i < centers.length; i += 1) {
+      const prev = centers[i - 1];
+      const curr = centers[i];
+      if (prev === undefined || curr === undefined) {
+        continue;
+      }
+      const gap = curr - prev;
+      if (gap > bestGap) {
+        bestGap = gap;
+        splitIndex = i;
+      }
+    }
+    if (splitIndex < 0 || bestGap < 90) {
+      out.push(...pageLines);
+      continue;
+    }
+
+    const leftCenter = centers[splitIndex - 1];
+    const rightCenter = centers[splitIndex];
+    if (leftCenter === undefined || rightCenter === undefined) {
+      out.push(...pageLines);
+      continue;
+    }
+    const splitX = (leftCenter + rightCenter) / 2;
+    const left = pageLines.filter((line) => line.bbox.x + line.bbox.w / 2 <= splitX).sort((a, b) => b.y - a.y);
+    const right = pageLines.filter((line) => line.bbox.x + line.bbox.w / 2 > splitX).sort((a, b) => b.y - a.y);
+    if (left.length < 4 || right.length < 4) {
+      out.push(...pageLines);
+      continue;
+    }
+    out.push(...left, ...right);
+  }
+
+  return out;
+}
+
+function extractAuthorYearEntries(lines: LineEntry[], docId: string, startIndex: number): ReferenceEntry[] {
+  if (startIndex < 0 || startIndex >= lines.length) {
+    return [];
+  }
+
+  const out: ReferenceEntry[] = [];
+  const scoped = reorderLinesByPageColumn(lines.slice(startIndex + 1));
+  let currentText = "";
+  let currentPage = -1;
+  let anchorX = 0;
+  let sequence = 1;
+
+  const flush = (): void => {
+    const finalText = normalizeSpaces(currentText);
+    if (finalText.length >= 24 && /\((?:19|20)\d{2}[a-z]?\)/i.test(finalText)) {
+      out.push({
+        docId,
+        index: sequence,
+        text: finalText,
+        page: currentPage > 0 ? currentPage : (out[out.length - 1]?.page ?? 1),
+      });
+      sequence += 1;
+    }
+    currentText = "";
+    currentPage = -1;
+    anchorX = 0;
+  };
+
+  for (const line of scoped) {
+    const normalized = normalizeEntryLeadNoise(line.text);
+    if (!normalized) {
+      continue;
+    }
+
+    if (looksLikeAuthorYearStart(normalized)) {
+      flush();
+      currentText = normalized;
+      currentPage = line.page;
+      anchorX = line.bbox.x;
+      continue;
+    }
+
+    if (!currentText) {
+      continue;
+    }
+    if (isLikelyReferenceFooter(normalized)) {
+      continue;
+    }
+    if (!isLikelyEntryContinuation(normalized)) {
+      continue;
+    }
+    if (line.page > currentPage + 1) {
+      flush();
+      continue;
+    }
+    if (line.page === currentPage && Math.abs(line.bbox.x - anchorX) > 170) {
+      continue;
+    }
+    currentText = `${currentText} ${normalized}`;
+  }
+
+  flush();
+  return out;
+}
+
+function isNumberedEntriesUnreliable(entries: ReferenceEntry[]): boolean {
+  if (entries.length === 0) {
+    return true;
+  }
+  const indices = entries.map((entry) => entry.index).filter((idx) => idx > 0);
+  const maxIndex = Math.max(...indices);
+  const prefix = densePrefixLength(indices);
+  const density = entries.length / Math.max(1, maxIndex);
+  if (maxIndex >= 400) {
+    return true;
+  }
+  if (maxIndex > entries.length * 6 && density < 0.2) {
+    return true;
+  }
+  if (entries.length >= 10 && prefix < 4) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeSurname(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/^[^a-z]+/g, "")
+    .replace(/[^a-z'’\-]+$/g, "");
+}
+
+function extractEntryAuthorYearKeys(entryText: string): string[] {
+  const yearMatch = entryText.match(/\((?:19|20)\d{2}[a-z]?\)/i);
+  if (!yearMatch) {
+    return [];
+  }
+  const year = normalizeYear(yearMatch[0] ?? "");
+  if (!year) {
+    return [];
+  }
+
+  const keys = new Set<string>();
+  const startSurname = entryText.match(/^\s*([A-Z][A-Za-z'’\-]{1,40}),/);
+  if (startSurname?.[1]) {
+    const surname = normalizeSurname(startSurname[1]);
+    if (surname) {
+      keys.add(`${surname}:${year}`);
+    }
+  }
+  const andPair = entryText.match(/^\s*([A-Z][A-Za-z'’\-]{1,40})\s+(?:and|&)\s+([A-Z][A-Za-z'’\-]{1,40}),/);
+  if (andPair?.[1]) {
+    const surname = normalizeSurname(andPair[1]);
+    if (surname) {
+      keys.add(`${surname}:${year}`);
+    }
+  }
+  return [...keys];
+}
+
+function buildAuthorYearEntryIndex(entries: ReferenceEntry[]): Map<string, number[]> {
+  const map = new Map<string, number[]>();
+  for (const entry of entries) {
+    const keys = extractEntryAuthorYearKeys(entry.text);
+    for (const key of keys) {
+      const list = map.get(key) ?? [];
+      if (!list.includes(entry.index)) {
+        list.push(entry.index);
+      }
+      map.set(key, list);
+    }
+  }
+  return map;
+}
+
+function parseAuthorYearToken(token: string): { surname: string; year: string } | null {
+  const normalized = normalizeSpaces(token);
+  if (!normalized) {
+    return null;
+  }
+
+  const etAl = normalized.match(/([A-Z][A-Za-z'’\-]{1,40})\s+et\s+al\.,\s*(?:19|20)\d{2}[a-z]?/i);
+  if (etAl?.[1]) {
+    return {
+      surname: normalizeSurname(etAl[1]),
+      year: "",
+    };
+  }
+
+  const andPair = normalized.match(
+    /([A-Z][A-Za-z'’\-]{1,40})\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40},\s*(?:19|20)\d{2}[a-z]?/i,
+  );
+  if (andPair?.[1]) {
+    return {
+      surname: normalizeSurname(andPair[1]),
+      year: "",
+    };
+  }
+
+  const single = normalized.match(/([A-Z][A-Za-z'’\-]{1,40}),\s*(?:19|20)\d{2}[a-z]?/i);
+  if (single?.[1]) {
+    return {
+      surname: normalizeSurname(single[1]),
+      year: "",
+    };
+  }
+
+  return null;
+}
+
+function parseAuthorYearGroupToIndices(groupText: string, entryIndexByAuthorYear: Map<string, number[]>): number[] {
+  const parts = groupText.split(";").map((part) => normalizeSpaces(part)).filter(Boolean);
+  if (parts.length === 0) {
+    return [];
+  }
+
+  const indices: number[] = [];
+  const seen = new Set<number>();
+  for (const part of parts) {
+    const parsed = parseAuthorYearToken(part);
+    if (!parsed || !parsed.surname) {
+      continue;
+    }
+    const years = [...part.matchAll(/(?:19|20)\d{2}[a-z]?/g)]
+      .map((match) => normalizeYear(match[0] ?? ""))
+      .filter(Boolean);
+    if (years.length === 0) {
+      continue;
+    }
+    for (const year of years) {
+      const matched = entryIndexByAuthorYear.get(`${parsed.surname}:${year}`) ?? [];
+      for (const idx of matched) {
+        if (!seen.has(idx)) {
+          seen.add(idx);
+          indices.push(idx);
+        }
+      }
+    }
+  }
+  return indices;
+}
+
+function parseAuthorYearSnippetToIndices(snippet: string, entryIndexByAuthorYear: Map<string, number[]>): number[] {
+  const parsed = parseAuthorYearToken(snippet);
+  if (!parsed || !parsed.surname) {
+    return [];
+  }
+  const years = [...snippet.matchAll(/(?:19|20)\d{2}[a-z]?/g)]
+    .map((match) => normalizeYear(match[0] ?? ""))
+    .filter(Boolean);
+  if (years.length === 0) {
+    return [];
+  }
+
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const year of years) {
+    const matched = entryIndexByAuthorYear.get(`${parsed.surname}:${year}`) ?? [];
+    for (const idx of matched) {
+      if (!seen.has(idx)) {
+        seen.add(idx);
+        out.push(idx);
+      }
+    }
+  }
+  return out;
+}
+
 function isLikelySuperscriptMarker(line: LineEntry, token: LineToken, cleanedText: string, indices: number[]): boolean {
   if (indices.length === 0) {
     return false;
@@ -589,7 +957,12 @@ function filterMarkersByEntryIndex(markers: InTextReferenceMarker[], entries: Re
   return markers.filter((marker) => marker.indices.every((index) => allowed.has(index)));
 }
 
-function extractInTextMarkers(lines: LineEntry[], docId: string, referencesStart: number): InTextReferenceMarker[] {
+function extractInTextMarkers(
+  lines: LineEntry[],
+  docId: string,
+  referencesStart: number,
+  entryIndexByAuthorYear: Map<string, number[]>,
+): InTextReferenceMarker[] {
   const markers: InTextReferenceMarker[] = [];
   const contentLines = referencesStart >= 0 ? lines.slice(0, referencesStart) : lines;
 
@@ -634,6 +1007,60 @@ function extractInTextMarkers(lines: LineEntry[], docId: string, referencesStart
         bbox: token.span.bbox,
       });
     }
+
+    if (entryIndexByAuthorYear.size > 0) {
+      for (const match of line.text.matchAll(AUTHOR_YEAR_GROUP_PATTERN)) {
+        const full = match[0] ?? "";
+        const body = match[1] ?? "";
+        const start = match.index ?? -1;
+        if (start < 0 || !/(?:19|20)\d{2}/.test(body)) {
+          continue;
+        }
+        const end = start + full.length;
+        const indices = parseAuthorYearGroupToIndices(body, entryIndexByAuthorYear);
+        if (indices.length === 0) {
+          continue;
+        }
+        const bbox = matchRectFromTokens(line.tokens, start, end) ?? line.bbox;
+        markers.push({
+          id: randomUUID(),
+          docId,
+          page: line.page,
+          text: full,
+          indices,
+          bbox,
+        });
+      }
+
+      for (const match of line.text.matchAll(INLINE_AUTHOR_YEAR_PATTERN)) {
+        const full = match[0] ?? "";
+        const start = match.index ?? -1;
+        if (start < 0) {
+          continue;
+        }
+        const before = start > 0 ? line.text[start - 1] ?? "" : "";
+        const after = line.text[start + full.length] ?? "";
+        // Inline mode is meant for non-parenthesized mentions; parenthesized ones
+        // are already handled by AUTHOR_YEAR_GROUP_PATTERN.
+        if (before === "(" || after === ")") {
+          continue;
+        }
+        const indices = parseAuthorYearSnippetToIndices(full, entryIndexByAuthorYear);
+        if (indices.length === 0) {
+          continue;
+        }
+        const end = start + full.length;
+        const bbox = matchRectFromTokens(line.tokens, start, end) ?? line.bbox;
+        markers.push({
+          id: randomUUID(),
+          docId,
+          page: line.page,
+          text: full,
+          indices,
+          bbox,
+        });
+      }
+    }
   }
 
   return dedupeMarkers(markers);
@@ -648,8 +1075,14 @@ export function extractReferenceData(spans: ParsedTextSpan[], docId: string): Re
     }
     return guessReferencesStartByCandidates(lines);
   })();
-  const entries = extractReferenceEntries(lines, docId, referencesStart);
-  const markers = filterMarkersByEntryIndex(extractInTextMarkers(lines, docId, referencesStart), entries);
+  const numberedEntries = extractReferenceEntries(lines, docId, referencesStart);
+  const authorYearEntries = extractAuthorYearEntries(lines, docId, referencesStart);
+  const entries =
+    authorYearEntries.length >= 8 && (isNumberedEntriesUnreliable(numberedEntries) || authorYearEntries.length > numberedEntries.length * 1.25)
+      ? authorYearEntries
+      : numberedEntries;
+  const authorYearIndex = buildAuthorYearEntryIndex(entries);
+  const markers = filterMarkersByEntryIndex(extractInTextMarkers(lines, docId, referencesStart, authorYearIndex), entries);
   return { markers, entries };
 }
 
