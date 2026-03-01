@@ -1,11 +1,17 @@
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getDocument, GlobalWorkerOptions, Util } from "pdfjs-dist/legacy/build/pdf.mjs";
 import type { ParsedTextSpan, Rect } from "@journal-reader/types";
 
 const require = createRequire(import.meta.url);
 const workerModulePath = require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+const pdfjsRoot = dirname(require.resolve("pdfjs-dist/package.json"));
+const cMapDir = join(pdfjsRoot, "cmaps");
+const standardFontsDir = join(pdfjsRoot, "standard_fonts");
+const cMapUrl = `${cMapDir.replace(/\/?$/, "/")}`;
+const standardFontDataUrl = `${standardFontsDir.replace(/\/?$/, "/")}`;
 GlobalWorkerOptions.workerSrc = pathToFileURL(workerModulePath).toString();
 
 type OpenedPdf = {
@@ -20,6 +26,9 @@ function buildNodeDocumentInput(data: Uint8Array): GetDocumentInput {
     data,
     // Node-side parsing in main process should not spawn a PDF.js worker.
     disableWorker: true,
+    cMapUrl,
+    cMapPacked: true,
+    standardFontDataUrl,
   };
   return input;
 }

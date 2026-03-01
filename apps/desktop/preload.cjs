@@ -1,6 +1,15 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const api = {
+  openExternal: (url) => ipcRenderer.invoke('app.openExternal', url),
+  resolveDroppedFilePath: (file) => {
+    try {
+      const path = webUtils.getPathForFile(file);
+      return path || null;
+    } catch (_error) {
+      return null;
+    }
+  },
   docPick: () => ipcRenderer.invoke('doc.pick'),
   onMenuFileOpen: (handler) => {
     const listener = (_event, path) => handler(path);
@@ -26,6 +35,7 @@ const api = {
   referenceHasEntries: (docId) => ipcRenderer.invoke('reference.hasEntries', docId),
   referenceOpenPopup: (payload) => ipcRenderer.invoke('reference.openPopup', payload),
   figureGetTarget: (docId, targetId) => ipcRenderer.invoke('figure.getTarget', docId, targetId),
+  figureListTargets: (docId, kind, label) => ipcRenderer.invoke('figure.listTargets', docId, kind, label),
   figureOpenPopup: (payload) => ipcRenderer.invoke('figure.openPopup', payload),
   annotationCreate: (payload) => ipcRenderer.invoke('annotation.create', payload),
   annotationUpdate: (payload) => ipcRenderer.invoke('annotation.update', payload),

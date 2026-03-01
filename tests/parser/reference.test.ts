@@ -122,4 +122,37 @@ describe("extractReferenceData", () => {
     expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([16, 17]));
     expect(out.entries.some((entry) => entry.index === 2022)).toBe(false);
   });
+
+  it("parses reference entries with leading line numbers and filters markers not in entry set", () => {
+    const spans = [
+      { text: "Signal remains stable", page: 1, bbox: { x: 20, y: 700, w: 180, h: 16 } },
+      { text: "1603,1604", page: 1, bbox: { x: 205, y: 706, w: 64, h: 11 } },
+      { text: "References", page: 2, bbox: { x: 20, y: 760, w: 120, h: 16 } },
+      { text: "2101 1. Alpha et al. First entry.", page: 2, bbox: { x: 20, y: 734, w: 320, h: 14 } },
+      { text: "2102 2. Beta et al. Second entry.", page: 2, bbox: { x: 20, y: 716, w: 320, h: 14 } },
+      { text: "2103 3. Gamma et al. Third entry.", page: 2, bbox: { x: 20, y: 698, w: 320, h: 14 } },
+      { text: "2104 4. Delta et al. Fourth entry.", page: 2, bbox: { x: 20, y: 680, w: 320, h: 14 } },
+      { text: "2105 5. Epsilon et al. Fifth entry.", page: 2, bbox: { x: 20, y: 662, w: 320, h: 14 } },
+      { text: "2106 6. Zeta et al. Sixth entry.", page: 2, bbox: { x: 20, y: 644, w: 320, h: 14 } },
+      { text: "2107 7. Eta et al. Seventh entry.", page: 2, bbox: { x: 20, y: 626, w: 320, h: 14 } },
+      { text: "2108 8. Theta et al. Eighth entry.", page: 2, bbox: { x: 20, y: 608, w: 320, h: 14 } },
+      { text: "2109 9. Iota et al. Ninth entry.", page: 2, bbox: { x: 20, y: 590, w: 320, h: 14 } },
+      { text: "2110 10. Kappa et al. Tenth entry.", page: 2, bbox: { x: 20, y: 572, w: 320, h: 14 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref5");
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+    expect(out.markers.some((marker) => marker.indices.includes(1603))).toBe(false);
+  });
+
+  it("detects references header with line-number prefix", () => {
+    const spans = [
+      { text: "2011 References", page: 9, bbox: { x: 16, y: 760, w: 180, h: 14 } },
+      { text: "2012 1. First entry in list.", page: 9, bbox: { x: 16, y: 742, w: 260, h: 14 } },
+      { text: "2013 2. Second entry in list.", page: 9, bbox: { x: 16, y: 724, w: 260, h: 14 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref6");
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([1, 2]));
+  });
 });

@@ -561,6 +561,54 @@ export class StorageRepository {
     };
   }
 
+  listTargetsByKindLabel(docId: string, kind: TargetKind, label: string): VisualTarget[] {
+    const normalized = normalizeLabel(label);
+    const base = baseLabel(normalized);
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM visual_targets
+         WHERE doc_id = @doc_id
+           AND kind = @kind`,
+      )
+      .all({ doc_id: docId, kind }) as VisualTargetRow[];
+
+    const candidates = rows.filter((row) => {
+      const rowLabel = normalizeLabel(row.label);
+      if (rowLabel === normalized) {
+        return true;
+      }
+      return baseLabel(rowLabel) === base;
+    });
+
+    return candidates
+      .map((row) => ({
+        id: row.id,
+        docId: row.doc_id,
+        kind: row.kind,
+        label: row.label,
+        page: row.page,
+        cropRect: JSON.parse(row.crop_rect_json) as Rect,
+        captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
+        caption: row.caption,
+        confidence: row.confidence,
+        source: row.source,
+      }))
+      .sort((a, b) => {
+        const aExact = normalizeLabel(a.label) === normalized ? 1 : 0;
+        const bExact = normalizeLabel(b.label) === normalized ? 1 : 0;
+        if (aExact !== bExact) {
+          return bExact - aExact;
+        }
+        const aManual = a.source === "manual" ? 1 : 0;
+        const bManual = b.source === "manual" ? 1 : 0;
+        if (aManual !== bManual) {
+          return bManual - aManual;
+        }
+        return b.confidence - a.confidence;
+      });
+  }
+
   createAnnotation(
     payload: Omit<AnnotationItem, "id" | "createdAt" | "updatedAt"> & { id?: string },
   ): AnnotationItem {
@@ -727,11 +775,9 @@ export class StorageRepository {
     tablesCount: number;
     suppCount: number;
   } {
-    const citationRefs = (this.db.prepare("SELECT COUNT(*) AS n FROM citations WHERE doc_id = ?").get(docId) as { n: number }).n;
-    const textRefs = (
-      this.db.prepare("SELECT COUNT(*) AS n FROM reference_markers WHERE doc_id = ?").get(docId) as { n: number }
+    const refsCount = (
+      this.db.prepare("SELECT COUNT(*) AS n FROM reference_entries WHERE doc_id = ?").get(docId) as { n: number }
     ).n;
-    const refsCount = citationRefs + textRefs;
     const figuresCount = (
       this.db
         .prepare("SELECT COUNT(*) AS n FROM visual_targets WHERE doc_id = ? AND kind = 'figure'")

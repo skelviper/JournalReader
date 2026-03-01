@@ -12,7 +12,7 @@ import {
   PDFPage,
   PDFString,
 } from "pdf-lib";
-import type { AnnotationItem, Rect, SavePdfResponse } from "@journal-reader/types";
+import type { AnnotationItem, NoteTextStyle, Rect, SavePdfResponse } from "@journal-reader/types";
 
 const JR_PREFIX = "JR:";
 const JR_META_VERSION = 1;
@@ -39,6 +39,7 @@ type PersistedAnnotationMeta = {
   rects: Rect[];
   text?: string;
   color?: string;
+  style?: NoteTextStyle;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -168,6 +169,23 @@ function parseMetaFromDict(dict: PDFDict): PersistedAnnotationMeta | null {
     if (rects.length === 0) {
       return null;
     }
+    const styleRaw = (parsed.style ?? null) as NoteTextStyle | null;
+    const style =
+      styleRaw &&
+      typeof styleRaw === "object" &&
+      (typeof styleRaw.fontSize === "number" ||
+        typeof styleRaw.fontFamily === "string" ||
+        typeof styleRaw.textColor === "string")
+        ? {
+            fontSize:
+              typeof styleRaw.fontSize === "number" && Number.isFinite(styleRaw.fontSize)
+                ? styleRaw.fontSize
+                : undefined,
+            fontFamily: typeof styleRaw.fontFamily === "string" ? styleRaw.fontFamily : undefined,
+            textColor: typeof styleRaw.textColor === "string" ? styleRaw.textColor : undefined,
+          }
+        : undefined;
+
     return {
       v: typeof parsed.v === "number" ? parsed.v : 0,
       id: parsed.id,
@@ -175,6 +193,7 @@ function parseMetaFromDict(dict: PDFDict): PersistedAnnotationMeta | null {
       rects,
       text: typeof parsed.text === "string" ? parsed.text : undefined,
       color: typeof parsed.color === "string" ? parsed.color : undefined,
+      style,
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : undefined,
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined,
     };
@@ -267,6 +286,7 @@ function parseFallbackAnnotation(dict: PDFDict, page: number): AnnotationItem | 
     rects: rects.map(cloneRect),
     text: text && text.length > 0 ? text : undefined,
     color,
+    style: undefined,
     createdAt: now,
     updatedAt: now,
   };
@@ -286,6 +306,7 @@ function annotationFromDict(dict: PDFDict, page: number): AnnotationItem | null 
       rects: meta.rects.map(cloneRect),
       text: meta.text,
       color: meta.color,
+      style: meta.style,
       createdAt,
       updatedAt,
     };
@@ -301,6 +322,7 @@ function buildMeta(annotation: AnnotationItem): PersistedAnnotationMeta {
     rects: annotation.rects.map(normalizeRect),
     text: annotation.text,
     color: annotation.color,
+    style: annotation.style,
     createdAt: annotation.createdAt,
     updatedAt: annotation.updatedAt,
   };
@@ -401,6 +423,7 @@ function normalizeInputAnnotation(annotation: AnnotationItem): AnnotationItem {
     rects,
     text: annotation.text,
     color: annotation.color,
+    style: annotation.style,
     createdAt: annotation.createdAt || now,
     updatedAt: annotation.updatedAt || now,
   };

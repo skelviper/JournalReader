@@ -4,6 +4,8 @@
     "composite": true,
     "rootDir": "src/preload",
     "outDir": "dist/preload",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
     "lib": ["ES2022", "DOM"],
     "types": ["node", "electron"]
   },

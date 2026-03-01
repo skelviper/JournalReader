@@ -1,6 +1,6 @@
 {
   "name": "@journal-reader/pdf-core",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@journal-reader/types": "0.1.0",
+    "@journal-reader/types": "0.0.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.10.38"
   }

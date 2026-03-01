@@ -32,6 +32,12 @@ export type VisualTarget = {
 
 export type AnnotationKind = "highlight" | "text-note" | "sticky-note";
 
+export type NoteTextStyle = {
+  fontSize?: number;
+  fontFamily?: string;
+  textColor?: string;
+};
+
 export type AnnotationItem = {
   id: string;
   docId: string;
@@ -40,6 +46,7 @@ export type AnnotationItem = {
   rects: Rect[];
   text?: string;
   color?: string;
+  style?: NoteTextStyle;
   createdAt: string;
   updatedAt: string;
 };
@@ -97,6 +104,19 @@ export type FigureTargetResponse = {
   imageDataUrl: string;
 };
 
+export type FigureTargetCandidate = {
+  id: string;
+  docId: string;
+  kind: TargetKind;
+  label: string;
+  page: number;
+  cropRect: Rect;
+  captionRect?: Rect;
+  caption: string;
+  confidence: number;
+  source: "auto" | "manual";
+};
+
 export type FigurePopupPayload = {
   docId: string;
   targetId: string;
@@ -143,6 +163,8 @@ export type BindManuallyResponse = {
 };
 
 export type JournalApi = {
+  openExternal: (url: string) => Promise<boolean>;
+  resolveDroppedFilePath: (file: File) => string | null;
   docPick: () => Promise<string | null>;
   onMenuFileOpen: (handler: (path: string) => void) => () => void;
   onAnnotationChanged: (handler: (event: AnnotationChangedEvent) => void) => () => void;
@@ -156,6 +178,7 @@ export type JournalApi = {
   referenceHasEntries: (docId: string) => Promise<boolean>;
   referenceOpenPopup: (payload: { indices: number[]; entries: ReferenceEntry[] }) => Promise<void>;
   figureGetTarget: (docId: string, targetId: string) => Promise<FigureTargetResponse>;
+  figureListTargets: (docId: string, kind: TargetKind, label: string) => Promise<FigureTargetCandidate[]>;
   figureOpenPopup: (payload: FigurePopupPayload) => Promise<void>;
   annotationCreate: (payload: CreateAnnotationPayload) => Promise<AnnotationItem>;
   annotationUpdate: (payload: UpdateAnnotationPayload) => Promise<AnnotationItem | null>;
@@ -186,5 +209,6 @@ export type ParsedCaption = {
   caption: string;
   page: number;
   bbox: Rect;
+  layoutRect?: Rect;
   quality?: number;
 };

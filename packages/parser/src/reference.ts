@@ -23,10 +23,21 @@ type ReferenceParseResult = {
 const BRACKET_MARKER_PATTERN = /\[(\s*\d{1,4}(?:\s*[-–]\s*\d{1,4})?(?:\s*,\s*\d{1,4}(?:\s*[-–]\s*\d{1,4})?)*)\]/g;
 const BRACKET_ENTRY_PATTERN = /^\s*\[(\d{1,4})\]\s*(.*)$/;
 const NUMBERED_ENTRY_PATTERN = /^\s*(\d{1,4})[.)]\s*(.*)$/;
-const REFERENCES_HEADER_PATTERN = /^\s*(references|bibliography)\b/i;
+const LOOSE_NUMBERED_ENTRY_PATTERN = /^\s*(\d{1,4})\s+(.+)$/;
+const REFERENCES_HEADER_PATTERN = /^\s*(reference|references|bibliography|literature cited|works cited)\b/i;
 
 function normalizeSpaces(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeEntryLeadNoise(text: string): string {
+  let out = normalizeSpaces(text);
+  out = out.replace(/^[•·\-–]+\s+/, "");
+  const withLineNumber = out.match(/^\(?\d{3,6}\)?[.:]?\s+((?:\[\d{1,4}\]|\d{1,4}[.)])\s+.+)$/);
+  if (withLineNumber?.[1]) {
+    out = withLineNumber[1].trim();
+  }
+  return out;
 }
 
 function unionRects(rects: Rect[]): Rect {
@@ -310,11 +321,12 @@ function matchRectFromTokens(tokens: LineToken[], start: number, end: number): R
 }
 
 function findReferencesStart(lines: LineEntry[]): number {
-  return lines.findIndex((line) => REFERENCES_HEADER_PATTERN.test(line.text));
+  return lines.findIndex((line) => REFERENCES_HEADER_PATTERN.test(normalizeEntryLeadNoise(line.text)));
 }
 
 function parseEntryStart(text: string): { index: number; body: string } | null {
-  const bracket = text.match(BRACKET_ENTRY_PATTERN);
+  const normalizedText = normalizeEntryLeadNoise(text);
+  const bracket = normalizedText.match(BRACKET_ENTRY_PATTERN);
   if (bracket) {
     return {
       index: Number(bracket[1]),
@@ -322,12 +334,21 @@ function parseEntryStart(text: string): { index: number; body: string } | null {
     };
   }
 
-  const numbered = text.match(NUMBERED_ENTRY_PATTERN);
+  const numbered = normalizedText.match(NUMBERED_ENTRY_PATTERN);
   if (numbered) {
     return {
       index: Number(numbered[1]),
       body: normalizeSpaces(numbered[2] ?? ""),
     };
+  }
+
+  const looseNumbered = normalizedText.match(LOOSE_NUMBERED_ENTRY_PATTERN);
+  if (looseNumbered) {
+    const index = Number(looseNumbered[1]);
+    const body = normalizeSpaces(looseNumbered[2] ?? "");
+    if (index >= 1 && index <= 999 && body.length >= 10 && /[A-Za-z]/.test(body)) {
+      return { index, body };
+    }
   }
 
   return null;
@@ -346,10 +367,11 @@ function isNearLineStart(text: string, start: number): boolean {
 }
 
 function parseEntryStartsInLine(text: string): Array<{ index: number; body: string }> {
+  const normalized = normalizeEntryLeadNoise(text);
   const out: Array<{ index: number; body: string }> = [];
-  const dotMatches = [...text.matchAll(/(\d{1,4})\.\s+/g)];
+  const dotMatches = [...normalized.matchAll(/(\d{1,4})\.\s+/g)];
   const firstStart = dotMatches[0]?.index ?? -1;
-  const nearStart = isNearLineStart(text, firstStart);
+  const nearStart = isNearLineStart(normalized, firstStart);
 
   if (nearStart && dotMatches.length > 1) {
     for (let i = 0; i < dotMatches.length; i += 1) {
@@ -359,8 +381,8 @@ function parseEntryStartsInLine(text: string): Array<{ index: number; body: stri
       if (start < 0) {
         continue;
       }
-      const end = next?.index ?? text.length;
-      const segment = text.slice(start, end).trim();
+      const end = next?.index ?? normalized.length;
+      const segment = normalized.slice(start, end).trim();
       const parsed = parseEntryStart(segment);
       if (parsed) {
         out.push(parsed);
@@ -372,13 +394,13 @@ function parseEntryStartsInLine(text: string): Array<{ index: number; body: stri
     out.length = 0;
   }
 
-  const single = parseEntryStart(text);
+  const single = parseEntryStart(normalized);
   if (single) {
     return [single];
   }
 
   if (nearStart && firstStart > 0) {
-    const sliced = parseEntryStart(text.slice(firstStart).trim());
+    const sliced = parseEntryStart(normalized.slice(firstStart).trim());
     if (sliced) {
       return [sliced];
     }
@@ -434,13 +456,14 @@ function guessReferencesStartByCandidates(lines: LineEntry[]): number {
 }
 
 function isLikelyEntryContinuation(text: string): boolean {
-  if (!text.trim()) {
+  const normalized = normalizeEntryLeadNoise(text);
+  if (!normalized.trim()) {
     return false;
   }
-  if (REFERENCES_HEADER_PATTERN.test(text)) {
+  if (REFERENCES_HEADER_PATTERN.test(normalized)) {
     return false;
   }
-  if (/^(acknowledg|author contributions|data availability|code availability)\b/i.test(text)) {
+  if (/^(acknowledg|author contributions|data availability|code availability)\b/i.test(normalized)) {
     return false;
   }
   return true;
@@ -558,6 +581,14 @@ function dedupeMarkers(markers: InTextReferenceMarker[]): InTextReferenceMarker[
   return [...uniq.values()];
 }
 
+function filterMarkersByEntryIndex(markers: InTextReferenceMarker[], entries: ReferenceEntry[]): InTextReferenceMarker[] {
+  if (entries.length < 10) {
+    return markers;
+  }
+  const allowed = new Set(entries.map((entry) => entry.index));
+  return markers.filter((marker) => marker.indices.every((index) => allowed.has(index)));
+}
+
 function extractInTextMarkers(lines: LineEntry[], docId: string, referencesStart: number): InTextReferenceMarker[] {
   const markers: InTextReferenceMarker[] = [];
   const contentLines = referencesStart >= 0 ? lines.slice(0, referencesStart) : lines;
@@ -618,7 +649,7 @@ export function extractReferenceData(spans: ParsedTextSpan[], docId: string): Re
     return guessReferencesStartByCandidates(lines);
   })();
   const entries = extractReferenceEntries(lines, docId, referencesStart);
-  const markers = extractInTextMarkers(lines, docId, referencesStart);
+  const markers = filterMarkersByEntryIndex(extractInTextMarkers(lines, docId, referencesStart), entries);
   return { markers, entries };
 }
 

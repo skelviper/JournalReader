@@ -1,8 +1,13 @@
 {
   "name": "journal-reader",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Electron PDF reader for literature with annotation and citation figure popup",
+  "author": "skelviper with help from Codex",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:skelviper/JournalReader.git"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -10,8 +15,14 @@
   "scripts": {
     "build:packages": "npm run --workspace @journal-reader/types build && npm run --workspace @journal-reader/parser build && npm run --workspace @journal-reader/storage build && npm run --workspace @journal-reader/pdf-core build && npm run --workspace @journal-reader/ui build",
     "build": "npm run build:packages && npm run --workspace @journal-reader/desktop build",
+    "pack:mac": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop pack:mac",
+    "dist:mac": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop dist:mac",
+    "dist:mac:dmg": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop dist:mac:dmg",
+    "dist:mac:arm64": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop dist:mac:arm64",
+    "dist:mac:x64": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop dist:mac:x64",
     "typecheck": "npm run --workspace @journal-reader/types typecheck && npm run --workspace @journal-reader/parser typecheck && npm run --workspace @journal-reader/storage typecheck && npm run --workspace @journal-reader/pdf-core typecheck && npm run --workspace @journal-reader/ui typecheck && npm run --workspace @journal-reader/desktop typecheck",
     "test": "vitest run",
+    "test:example-pdfs": "vitest run tests/example_pdfs.layout.test.ts",
     "test:watch": "vitest",
     "start": "npm run rebuild:native && npm run build:packages && npm run --workspace @journal-reader/desktop build:main && npm run --workspace @journal-reader/desktop build:preload && npm run --workspace @journal-reader/desktop dev",
     "rebuild:native": "npm run --workspace @journal-reader/desktop rebuild:native"

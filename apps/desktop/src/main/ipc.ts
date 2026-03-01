@@ -1,4 +1,4 @@
-import { app, ipcMain, BrowserWindow, dialog } from "electron";
+import { app, ipcMain, BrowserWindow, dialog, shell } from "electron";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -36,6 +36,13 @@ function cloneAnnotation(item: AnnotationItem): AnnotationItem {
   return {
     ...item,
     rects: item.rects.map((rect) => ({ ...rect })),
+    style: item.style
+      ? {
+          fontSize: item.style.fontSize,
+          fontFamily: item.style.fontFamily,
+          textColor: item.style.textColor,
+        }
+      : undefined,
   };
 }
 
@@ -49,6 +56,13 @@ function normalizeAnnotationPayload(item: AnnotationItem, docId: string): Annota
     ...item,
     docId,
     rects: item.rects.map((rect) => ({ ...rect })),
+    style: item.style
+      ? {
+          fontSize: item.style.fontSize,
+          fontFamily: item.style.fontFamily,
+          textColor: item.style.textColor,
+        }
+      : undefined,
     createdAt: item.createdAt || now,
     updatedAt: item.updatedAt || item.createdAt || now,
   };
@@ -680,6 +694,18 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     }
   };
 
+  ipcMain.handle("app.openExternal", async (_event, url: string) => {
+    if (typeof url !== "string") {
+      return false;
+    }
+    const trimmed = url.trim();
+    if (!/^https?:\/\//i.test(trimmed)) {
+      return false;
+    }
+    await shell.openExternal(trimmed);
+    return true;
+  });
+
   ipcMain.handle("doc.pick", async () => {
     const result = await dialog.showOpenDialog({
       title: "Open PDF",
@@ -773,6 +799,10 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       caption: target.caption,
       imageDataUrl: buildTargetPreviewDataUrl(target.caption, target.page, target.cropRect),
     };
+  });
+
+  ipcMain.handle("figure.listTargets", (_event, docId: string, kind: "figure" | "table" | "supplementary", label: string) => {
+    return repo.listTargetsByKindLabel(docId, kind, label);
   });
 
   ipcMain.handle("figure.openPopup", (_event, payload: FigurePopupPayload) => {
@@ -1134,6 +1164,13 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       rects: payload.rects.map((rect) => ({ ...rect })),
       text: payload.text,
       color: payload.color,
+      style: payload.style
+        ? {
+            fontSize: payload.style.fontSize,
+            fontFamily: payload.style.fontFamily,
+            textColor: payload.style.textColor,
+          }
+        : undefined,
       createdAt: now,
       updatedAt: now,
     };
@@ -1165,6 +1202,20 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       rects: payload.rects ? payload.rects.map((rect) => ({ ...rect })) : current.rects.map((rect) => ({ ...rect })),
       text: payload.text ?? current.text,
       color: payload.color ?? current.color,
+      style:
+        payload.style !== undefined
+          ? {
+              fontSize: payload.style?.fontSize,
+              fontFamily: payload.style?.fontFamily,
+              textColor: payload.style?.textColor,
+            }
+          : current.style
+            ? {
+                fontSize: current.style.fontSize,
+                fontFamily: current.style.fontFamily,
+                textColor: current.style.textColor,
+              }
+            : undefined,
       updatedAt: toIsoNow(),
     };
     list[index] = updated;

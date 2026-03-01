@@ -44,6 +44,71 @@ describe("extractCaptions", () => {
     expect(out.some((item) => item.caption.includes("No previous knowledge"))).toBe(false);
   });
 
+  it("matches lowercase fig/figure variants and supplementary prefixes", () => {
+    const spans = [
+      { text: "fig. 2: lower-case figure caption.", page: 6, bbox: { x: 16, y: 140, w: 250, h: 14 } },
+      { text: "supplementary fig. S8: extra experiment.", page: 7, bbox: { x: 18, y: 126, w: 280, h: 14 } },
+      { text: "extended data figure 4: benchmark controls.", page: 8, bbox: { x: 20, y: 110, w: 300, h: 14 } },
+    ];
+
+    const out = extractCaptions(spans);
+    expect(out.map((item) => `${item.kind}:${item.label}`)).toEqual(
+      expect.arrayContaining(["figure:2", "supplementary:S8", "supplementary:4"]),
+    );
+  });
+
+  it("accepts captions with leading line-number noise and panel-letter body", () => {
+    const spans = [
+      {
+        text: "1603 Extended Data Fig. 14",
+        page: 11,
+        bbox: { x: 18, y: 140, w: 220, h: 14 },
+      },
+      {
+        text: "a, Volcano plot showing perturbation effects.",
+        page: 11,
+        bbox: { x: 18, y: 126, w: 360, h: 14 },
+      },
+    ];
+
+    const out = extractCaptions(spans);
+    const cap = out.find((item) => item.kind === "supplementary" && item.label === "14");
+    expect(cap).toBeTruthy();
+    expect(cap?.caption).toContain("a, Volcano plot");
+  });
+
+  it("continues caption text onto next page when previous page ends near bottom", () => {
+    const spans = [
+      { text: "Fig. 5: Multi-page caption start.", page: 4, bbox: { x: 24, y: 52, w: 320, h: 14 } },
+      { text: "a, Description at bottom of page.", page: 4, bbox: { x: 24, y: 34, w: 340, h: 14 } },
+      { text: "b, Continuation appears at top of next page.", page: 5, bbox: { x: 24, y: 760, w: 360, h: 14 } },
+      { text: "c, Another continuation line.", page: 5, bbox: { x: 24, y: 742, w: 260, h: 14 } },
+    ];
+
+    const out = extractCaptions(spans);
+    const cap = out.find((item) => item.kind === "figure" && item.label === "5");
+    expect(cap).toBeTruthy();
+    expect(cap?.caption).toContain("a, Description at bottom of page.");
+    expect(cap?.caption).toContain("b, Continuation appears at top of next page.");
+    expect(cap?.caption).toContain("c, Another continuation line.");
+  });
+
+  it("does not cross pages for long same-page captions", () => {
+    const spans = [
+      { text: "Fig. 3: Long caption title with sufficient body on current page.", page: 12, bbox: { x: 22, y: 80, w: 420, h: 14 } },
+      { text: "a, first continuation on same page.", page: 12, bbox: { x: 22, y: 62, w: 300, h: 14 } },
+      { text: "b, second continuation on same page.", page: 12, bbox: { x: 22, y: 44, w: 320, h: 14 } },
+      { text: "c, this is still same-page content.", page: 12, bbox: { x: 22, y: 26, w: 300, h: 14 } },
+      { text: "The next page starts body text and should not be appended.", page: 13, bbox: { x: 22, y: 760, w: 480, h: 14 } },
+    ];
+
+    const out = extractCaptions(spans);
+    const cap = out.find((item) => item.kind === "figure" && item.label === "3");
+    expect(cap).toBeTruthy();
+    expect(cap?.caption).toContain("c, this is still same-page content.");
+    expect(cap?.caption).not.toContain("The next page starts body text");
+  });
+
   it("keeps multi-line caption body including subfigure descriptions", () => {
     const spans = [
       {
@@ -135,5 +200,30 @@ describe("extractCaptions", () => {
     expect(caption.indexOf("d, Correlation between predicted and measured values.")).toBeLessThan(
       caption.indexOf("h, Experimental validation of the activity of 232 bp synthetic"),
     );
+  });
+
+  it("keeps collecting two-column caption continuation with wider line spacing", () => {
+    const spans = [
+      {
+        text: "Fig. 1: Principle of PARM and validation.",
+        page: 2,
+        bbox: { x: 22, y: 168, w: 360, h: 12 },
+      },
+      { text: "a, Left col line 1.", page: 2, bbox: { x: 22, y: 140, w: 320, h: 12 } },
+      { text: "g, Right col line 1.", page: 2, bbox: { x: 452, y: 140, w: 340, h: 12 } },
+      { text: "b, Left col line 2.", page: 2, bbox: { x: 22, y: 112, w: 320, h: 12 } },
+      { text: "h, Right col line 2.", page: 2, bbox: { x: 452, y: 112, w: 340, h: 12 } },
+      { text: "c, Left col line 3.", page: 2, bbox: { x: 22, y: 84, w: 320, h: 12 } },
+      { text: "i, Right col line 3.", page: 2, bbox: { x: 452, y: 84, w: 340, h: 12 } },
+      { text: "d, Left col line 4.", page: 2, bbox: { x: 22, y: 56, w: 320, h: 12 } },
+    ];
+
+    const out = extractCaptions(spans);
+    const fig1 = out.find((item) => item.kind === "figure" && item.label === "1");
+    expect(fig1).toBeTruthy();
+    const caption = fig1?.caption ?? "";
+    expect(caption).toContain("d, Left col line 4.");
+    expect(caption.indexOf("c, Left col line 3.")).toBeLessThan(caption.indexOf("d, Left col line 4."));
+    expect(caption.indexOf("d, Left col line 4.")).toBeLessThan(caption.indexOf("g, Right col line 1."));
   });
 });

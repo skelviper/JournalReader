@@ -2,6 +2,8 @@
 
 面向 macOS 的桌面论文 PDF 阅读器，支持标注、笔记、文中引用点击后弹出图窗等能力。
 
+Author: skelviper with help from Codex.
+
 ## 当前已实现
 
 - `Electron + React + TypeScript` monorepo 架构。
@@ -67,10 +69,72 @@ npm run build
 npm test
 ```
 
+5. 运行样本 PDF 计数回归（layout-first）
+
+```bash
+npm run test:example-pdfs
+```
+
+可通过环境变量指定样本目录：
+
+```bash
+EXAMPLE_PDFS_DIR=/your/path/to/pdfs npm run test:example-pdfs
+```
+
+文件名约定（用于断言期望值）：
+
+- `4main47ref.pdf` -> 期望 `main=4, ref=47`
+- `5main64ref10ext.pdf` -> 期望 `main=5, ref=64, ext=10`
+- `7main17sup_refwithname.pdf` -> 期望 `main=7, sup=17`
+
+说明：
+
+- `main/ext` 使用 caption 的基标签去重计数（忽略子图字母如 `1a/1b`）。
+- `sup` 优先用非 table 的 supplementary figure 引用做连续序列计数（`1..N`），并与 caption 结果取更稳定值。
+- `ref` 使用参考文献索引的稠密前缀推断并过滤尾部离群值（例如正文误检到的 `316/400`）。
+
+## 打包与发布（macOS）
+
+1. 本地打包（默认产出 `zip`，最稳）
+
+```bash
+npm run dist:mac
+```
+
+2. 需要 `dmg` 时单独生成（可选）
+
+```bash
+npm run dist:mac:dmg
+```
+
+3. 仅打包当前架构（可选）
+
+```bash
+npm run dist:mac:arm64
+npm run dist:mac:x64
+```
+
+4. 仅生成未封装目录（调试安装包内容）
+
+```bash
+npm run pack:mac
+```
+
+产物目录：
+
+- `apps/desktop/release/`
+
+常见产物示例：
+
+- `Journal Reader-0.1.0-arm64.zip`
+- `Journal Reader-0.1.0-arm64.dmg`（可选）
+
 ## 说明
 
 - 当前版本默认输入为可提取文本层的 PDF（不包含 OCR 流程）。
 - 注释默认写回原 PDF 路径，备份文件为 `<原文件>.bak`。
+- 当前 `dist:mac` 默认不做代码签名和 notarization，适合本地测试与内部分发。
+- 若要对外正式 release（避免“无法验证开发者”提示），需要后续配置 Apple Developer 证书与 notarization。
 
 ## 已知问题 / 待办
 

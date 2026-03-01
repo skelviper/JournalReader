@@ -1,7 +1,16 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type { JournalApi } from "@journal-reader/types";
 
 const api: JournalApi = {
+  openExternal: (url) => ipcRenderer.invoke("app.openExternal", url),
+  resolveDroppedFilePath: (file) => {
+    try {
+      const path = webUtils.getPathForFile(file);
+      return path || null;
+    } catch {
+      return null;
+    }
+  },
   docPick: () => ipcRenderer.invoke("doc.pick"),
   onMenuFileOpen: (handler) => {
     const listener = (_event: Electron.IpcRendererEvent, path: string): void => {
@@ -31,6 +40,7 @@ const api: JournalApi = {
   referenceHasEntries: (docId) => ipcRenderer.invoke("reference.hasEntries", docId),
   referenceOpenPopup: (payload) => ipcRenderer.invoke("reference.openPopup", payload),
   figureGetTarget: (docId, targetId) => ipcRenderer.invoke("figure.getTarget", docId, targetId),
+  figureListTargets: (docId, kind, label) => ipcRenderer.invoke("figure.listTargets", docId, kind, label),
   figureOpenPopup: (payload) => ipcRenderer.invoke("figure.openPopup", payload),
   annotationCreate: (payload) => ipcRenderer.invoke("annotation.create", payload),
   annotationUpdate: (payload) => ipcRenderer.invoke("annotation.update", payload),

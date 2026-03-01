@@ -45,6 +45,10 @@ function guessCropRect(captionRect: Rect, kind: VisualTarget["kind"]): Rect {
   };
 }
 
+function captionTargetKey(kind: string, label: string, page: number): string {
+  return `${kind}:${baseLabel(label)}:${page}`;
+}
+
 export function mapCitationsToTargets(
   docId: string,
   citations: CitationRef[],
@@ -60,12 +64,51 @@ export function mapCitationsToTargets(
   }
 
   const targets: VisualTarget[] = [...existingManualTargets];
+  const autoTargetByCaption = new Map<string, VisualTarget>();
+
+  const pickedCaptionsByBase = new Map<string, ParsedCaption>();
+  for (const caption of captions) {
+    const dedupeKey = captionTargetKey(caption.kind, caption.label, caption.page);
+    const prev = pickedCaptionsByBase.get(dedupeKey);
+    if (!prev) {
+      pickedCaptionsByBase.set(dedupeKey, caption);
+      continue;
+    }
+    const prevBaseExact = baseLabel(prev.label) === prev.label.toUpperCase();
+    const nextBaseExact = baseLabel(caption.label) === caption.label.toUpperCase();
+    if (nextBaseExact && !prevBaseExact) {
+      pickedCaptionsByBase.set(dedupeKey, caption);
+      continue;
+    }
+    if ((caption.quality ?? 0.7) > (prev.quality ?? 0.7)) {
+      pickedCaptionsByBase.set(dedupeKey, caption);
+    }
+  }
+
+  for (const caption of pickedCaptionsByBase.values()) {
+    const target: VisualTarget = {
+      id: randomUUID(),
+      docId,
+      kind: caption.kind,
+      label: caption.label,
+      page: caption.page,
+      cropRect: caption.layoutRect ?? guessCropRect(caption.bbox, caption.kind),
+      captionRect: caption.bbox,
+      caption: caption.caption,
+      confidence: caption.quality ?? 0.7,
+      source: "auto",
+    };
+    targets.push(target);
+    autoTargetByCaption.set(captionTargetKey(caption.kind, caption.label, caption.page), target);
+  }
+
   const citationsToTarget = new Map<string, string>();
   const unresolvedCitationIds: string[] = [];
 
   for (const citation of citations) {
     const citationLabel = citation.label.toUpperCase();
     const citationBase = baseLabel(citationLabel);
+    const hasSubfigureSuffix = citationBase !== citationLabel;
     const manualMatch = existingManualTargets.find(
       (target) =>
         target.kind === citation.kind &&
@@ -76,9 +119,15 @@ export function mapCitationsToTargets(
       continue;
     }
 
-    let matchedCaptions = captionIdx.get(key(citation.kind, citation.label)) ?? [];
-    if (matchedCaptions.length === 0 && citationBase !== citationLabel) {
-      matchedCaptions = captionIdx.get(key(citation.kind, citationBase)) ?? [];
+    const exactCaptions = captionIdx.get(key(citation.kind, citation.label)) ?? [];
+    const baseCaptions = hasSubfigureSuffix ? (captionIdx.get(key(citation.kind, citationBase)) ?? []) : [];
+    let matchedCaptions = exactCaptions;
+    // For "Fig. 1a"/"1b" references, users expect to open the whole figure panel.
+    // Prefer the base caption (Fig. 1) when it exists; fall back to exact label otherwise.
+    if (hasSubfigureSuffix && baseCaptions.length > 0) {
+      matchedCaptions = baseCaptions;
+    } else if (matchedCaptions.length === 0 && baseCaptions.length > 0) {
+      matchedCaptions = baseCaptions;
     }
     if (matchedCaptions.length === 0) {
       unresolvedCitationIds.push(citation.id);
@@ -95,34 +144,13 @@ export function mapCitationsToTargets(
       }
     }
 
-    const existingAuto = targets.find(
-      (target) =>
-        target.source === "auto" &&
-        target.kind === citation.kind &&
-        target.label.toUpperCase() === best.label.toUpperCase() &&
-        target.page === best.page,
-    );
+    const existingAuto = autoTargetByCaption.get(captionTargetKey(best.kind, best.label, best.page));
 
-    if (existingAuto) {
+    if (existingAuto?.id) {
       citationsToTarget.set(citation.id, existingAuto.id);
       continue;
     }
-
-    const target: VisualTarget = {
-      id: randomUUID(),
-      docId,
-      kind: citation.kind,
-      label: best.label,
-      page: best.page,
-      cropRect: guessCropRect(best.bbox, citation.kind),
-      captionRect: best.bbox,
-      caption: best.caption,
-      confidence: bestScore,
-      source: "auto",
-    };
-
-    targets.push(target);
-    citationsToTarget.set(citation.id, target.id);
+    unresolvedCitationIds.push(citation.id);
   }
 
   return {
