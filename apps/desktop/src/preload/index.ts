@@ -1,6 +1,19 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type { JournalApi } from "@journal-reader/types";
 
+window.addEventListener(
+  "wheel",
+  (event) => {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+    }
+  },
+  { passive: false, capture: true },
+);
+window.addEventListener("gesturestart", (event) => event.preventDefault(), { passive: false });
+window.addEventListener("gesturechange", (event) => event.preventDefault(), { passive: false });
+window.addEventListener("gestureend", (event) => event.preventDefault(), { passive: false });
+
 const api: JournalApi = {
   openExternal: (url) => ipcRenderer.invoke("app.openExternal", url),
   resolveDroppedFilePath: (file) => {
@@ -40,9 +53,19 @@ const api: JournalApi = {
   referenceSearchByText: (docId, text, limit) => ipcRenderer.invoke("reference.searchByText", docId, text, limit),
   referenceHasEntries: (docId) => ipcRenderer.invoke("reference.hasEntries", docId),
   referenceOpenPopup: (payload) => ipcRenderer.invoke("reference.openPopup", payload),
+  translateText: (payload) => ipcRenderer.invoke("translate.text", payload),
+  translateOpenPopup: (payload) => ipcRenderer.invoke("translate.openPopup", payload),
   figureGetTarget: (docId, targetId) => ipcRenderer.invoke("figure.getTarget", docId, targetId),
   figureListTargets: (docId, kind, label) => ipcRenderer.invoke("figure.listTargets", docId, kind, label),
   figureOpenPopup: (payload) => ipcRenderer.invoke("figure.openPopup", payload),
+  recognizedOpenPopup: async (docId, kind) => {
+    try {
+      const result = await ipcRenderer.invoke("recognized.openPopup", docId, kind);
+      return Boolean(result);
+    } catch {
+      return false;
+    }
+  },
   annotationCreate: (payload) => ipcRenderer.invoke("annotation.create", payload),
   annotationUpdate: (payload) => ipcRenderer.invoke("annotation.update", payload),
   annotationDelete: (id) => ipcRenderer.invoke("annotation.delete", id),

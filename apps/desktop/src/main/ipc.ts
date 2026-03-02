@@ -20,7 +20,12 @@ import type {
   FigurePopupPayload,
   ParsedTextSpan,
   Rect,
+  RecognizedPopupKind,
   ReferenceEntry,
+  TranslatePopupPayload,
+  TranslateProvider,
+  TranslateTextPayload,
+  TranslateTextResponse,
 } from "@journal-reader/types";
 
 const CAPTION_WORD_META_PREFIX = "CAPTION_WORD_HL::";
@@ -686,6 +691,230 @@ function safeCaptionToHtml(caption: string): string {
   }
 }
 
+async function loadPopupHtmlFile(popup: BrowserWindow, prefix: string, html: string): Promise<boolean> {
+  try {
+    const popupDir = join(app.getPath("temp"), "journal-reader-popups");
+    await mkdir(popupDir, { recursive: true });
+    const popupFile = join(popupDir, `${prefix}-${Date.now()}-${randomUUID()}.html`);
+    await writeFile(popupFile, html, "utf-8");
+    popup.once("closed", () => {
+      void rm(popupFile, { force: true }).catch(() => undefined);
+    });
+    await popup.loadFile(popupFile);
+    return true;
+  } catch (error) {
+    const fallbackHtml = `<!doctype html><html><head><meta charset="utf-8"/><title>Popup Error</title><style>html,body{margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;background:#f3f6fa;color:#1e2d3f;padding:16px}pre{white-space:pre-wrap;word-break:break-word;background:#fff;border:1px solid #cbd7e4;border-radius:8px;padding:10px}</style></head><body><h3>Popup Rendering Error</h3><pre>${escapeHtml(error instanceof Error ? error.message : String(error))}</pre></body></html>`;
+    try {
+      await popup.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(fallbackHtml)}`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function normalizeLangCode(raw: string | undefined, fallback: string): string {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  return value || fallback;
+}
+
+async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 12000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function chunkText(text: string, maxChars: number): string[] {
+  const normalized = text.replace(/\r\n/g, "\n");
+  if (normalized.length <= maxChars) {
+    return [normalized];
+  }
+  const chunks: string[] = [];
+  let index = 0;
+  while (index < normalized.length) {
+    const next = normalized.slice(index, index + maxChars);
+    chunks.push(next);
+    index += maxChars;
+  }
+  return chunks;
+}
+
+async function translateWithGoogle(payload: TranslateTextPayload): Promise<TranslateTextResponse> {
+  const sourceLang = normalizeLangCode(payload.sourceLang, "auto");
+  const targetLang = normalizeLangCode(payload.targetLang, "en");
+  const chunks = chunkText(payload.text, 1500);
+  const translatedChunks: string[] = [];
+  let detectedSourceLang: string | undefined;
+  for (const chunk of chunks) {
+    const query = new URLSearchParams({
+      client: "gtx",
+      sl: sourceLang,
+      tl: targetLang,
+      dt: "t",
+      q: chunk,
+    });
+    const response = await fetchWithTimeout(`https://translate.googleapis.com/translate_a/single?${query.toString()}`, {
+      headers: {
+        Accept: "application/json,text/plain,*/*",
+        "User-Agent": "JournalReaderApp/0.0.1",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`Google translate request failed (${response.status})`);
+    }
+    const data = (await response.json()) as unknown;
+    const outer = Array.isArray(data) ? data : [];
+    const segments = Array.isArray(outer[0]) ? (outer[0] as unknown[]) : [];
+    const translatedChunk = segments
+      .map((segment) => {
+        const row = Array.isArray(segment) ? segment : [];
+        return typeof row[0] === "string" ? row[0] : "";
+      })
+      .join("");
+    if (!translatedChunk.trim()) {
+      throw new Error("Google returned an empty translation result.");
+    }
+    translatedChunks.push(translatedChunk);
+    if (!detectedSourceLang && typeof outer[2] === "string") {
+      detectedSourceLang = outer[2];
+    }
+  }
+  const translatedText = translatedChunks.join("").trim();
+  return {
+    provider: "google",
+    sourceLang,
+    targetLang,
+    detectedSourceLang,
+    translatedText,
+  };
+}
+
+async function translateWithLibre(payload: TranslateTextPayload): Promise<TranslateTextResponse> {
+  const sourceLang = normalizeLangCode(payload.sourceLang, "auto");
+  const targetLang = normalizeLangCode(payload.targetLang, "en");
+  const response = await fetchWithTimeout("https://libretranslate.de/translate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": "JournalReaderApp/0.0.1",
+    },
+    body: JSON.stringify({
+      q: payload.text,
+      source: sourceLang,
+      target: targetLang,
+      format: "text",
+      api_key: "",
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`LibreTranslate request failed (${response.status})`);
+  }
+  const data = (await response.json()) as {
+    translatedText?: string;
+    detectedLanguage?: { language?: string };
+  };
+  const translatedText = (data.translatedText ?? "").trim();
+  if (!translatedText) {
+    throw new Error("LibreTranslate returned an empty translation result.");
+  }
+  return {
+    provider: "libre",
+    sourceLang,
+    targetLang,
+    detectedSourceLang: data.detectedLanguage?.language,
+    translatedText,
+  };
+}
+
+async function translateWithMyMemory(payload: TranslateTextPayload): Promise<TranslateTextResponse> {
+  const sourceLang = normalizeLangCode(payload.sourceLang, "auto");
+  const targetLang = normalizeLangCode(payload.targetLang, "en");
+  const from = sourceLang === "auto" ? "en" : sourceLang;
+  const chunks = chunkText(payload.text, 600);
+  const translatedChunks: string[] = [];
+  for (const chunk of chunks) {
+    const query = new URLSearchParams({
+      q: chunk,
+      langpair: `${from}|${targetLang}`,
+    });
+    const response = await fetchWithTimeout(`https://api.mymemory.translated.net/get?${query.toString()}`, {
+      headers: {
+        Accept: "application/json,text/plain,*/*",
+        "User-Agent": "JournalReaderApp/0.0.1",
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`MyMemory request failed (${response.status})`);
+    }
+    const data = (await response.json()) as {
+      responseData?: { translatedText?: string };
+      responseStatus?: number;
+      responseDetails?: string;
+    };
+    if (data.responseStatus && data.responseStatus !== 200) {
+      throw new Error(data.responseDetails || `MyMemory returned ${data.responseStatus}`);
+    }
+    const piece = (data.responseData?.translatedText ?? "").trim();
+    if (!piece) {
+      throw new Error("MyMemory returned an empty translation result.");
+    }
+    translatedChunks.push(piece);
+  }
+  const translatedText = translatedChunks.join("").trim();
+  if (!translatedText) {
+    throw new Error("MyMemory returned an empty translation result.");
+  }
+  return {
+    provider: "mymemory",
+    sourceLang,
+    targetLang,
+    detectedSourceLang: sourceLang === "auto" ? undefined : sourceLang,
+    translatedText,
+  };
+}
+
+async function translateText(payload: TranslateTextPayload): Promise<TranslateTextResponse> {
+  const text = typeof payload.text === "string" ? payload.text.trim() : "";
+  if (!text) {
+    throw new Error("Text to translate is empty.");
+  }
+  const normalized: TranslateTextPayload = {
+    text,
+    sourceLang: normalizeLangCode(payload.sourceLang, "auto"),
+    targetLang: normalizeLangCode(payload.targetLang, "en"),
+    provider: payload.provider ?? "google",
+  };
+  const order: TranslateProvider[] =
+    normalized.provider === "google"
+      ? ["google", "libre", "mymemory"]
+      : normalized.provider === "libre"
+        ? ["libre", "mymemory", "google"]
+        : ["mymemory", "libre", "google"];
+  const failures: string[] = [];
+  for (const provider of order) {
+    try {
+      if (provider === "google") {
+        return await translateWithGoogle({ ...normalized, provider });
+      }
+      if (provider === "libre") {
+        return await translateWithLibre({ ...normalized, provider });
+      }
+      return await translateWithMyMemory({ ...normalized, provider });
+    } catch (error) {
+      failures.push(`${provider}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`Translation providers failed. ${failures.join(" | ")}`);
+}
+
 export function registerIpcHandlers(repo: StorageRepository): void {
   const notifyAnnotationChanged = (docId: string): void => {
     const payload = { docId, ts: Date.now() };
@@ -790,6 +1019,46 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     return repo.hasReferenceEntries(docId);
   });
 
+  ipcMain.handle("translate.text", async (_event, payload: TranslateTextPayload) => {
+    return translateText(payload);
+  });
+
+  ipcMain.handle("translate.openPopup", async (_event, payload: TranslatePopupPayload) => {
+    const popup = new BrowserWindow({
+      width: 760,
+      height: 540,
+      minWidth: 560,
+      minHeight: 420,
+      title: `Translation (${payload.provider})`,
+      webPreferences: {
+        sandbox: true,
+      },
+    });
+
+    const sourceLabel =
+      payload.sourceLang === "auto" ? `Auto (${payload.detectedSourceLang || "unknown"})` : payload.sourceLang;
+    const html = `<!doctype html>
+      <html>
+      <head><meta charset=\"utf-8\"/><title>Translation</title>
+      <style>
+      html,body{margin:0;padding:0;width:100%;height:100%}
+      body{padding:14px;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Helvetica Neue\",Arial,sans-serif;background:#f3f6fa;color:#1e2d3f;overflow:auto}
+      .meta{font-size:12px;color:#5b6d84;margin-bottom:10px}
+      .card{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px 12px}
+      .head{font-size:13px;font-weight:700;color:#31465f;margin:0 0 6px}
+      .txt{font-size:15px;line-height:1.54;white-space:pre-wrap;word-break:break-word}
+      .grid{display:grid;grid-template-rows:auto auto;gap:10px}
+      </style></head>
+      <body>
+        <div class=\"meta\">Provider: ${escapeHtml(payload.provider)} | ${escapeHtml(sourceLabel)} → ${escapeHtml(payload.targetLang)}</div>
+        <div class=\"grid\">
+          <div class=\"card\"><div class=\"head\">Source</div><div class=\"txt\">${escapeHtml(payload.sourceText)}</div></div>
+          <div class=\"card\"><div class=\"head\">Translation</div><div class=\"txt\">${escapeHtml(payload.translatedText)}</div></div>
+        </div>
+      </body></html>`;
+    await loadPopupHtmlFile(popup, "translation", html);
+  });
+
   ipcMain.handle("figure.getTarget", (_event, docId: string, targetId: string) => {
     const target = repo.getTarget(docId, targetId);
     if (!target) {
@@ -807,6 +1076,86 @@ export function registerIpcHandlers(repo: StorageRepository): void {
 
   ipcMain.handle("figure.listTargets", (_event, docId: string, kind: "figure" | "table" | "supplementary", label: string) => {
     return repo.listTargetsByKindLabel(docId, kind, label);
+  });
+
+  ipcMain.handle("recognized.openPopup", async (_event, docId: string, kind: RecognizedPopupKind) => {
+    try {
+      const popup = new BrowserWindow({
+        width: 960,
+        height: 760,
+        minWidth: 680,
+        minHeight: 520,
+        title: "Recognized Items",
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: false,
+        },
+      });
+
+      let title = "Recognized Items";
+      let rows = "";
+      try {
+        if (kind === "ref") {
+          title = "Recognized References";
+          const entries = repo.listAllReferenceEntries(docId);
+          rows = entries
+            .map(
+              (entry) =>
+                `<div class="row"><div class="id">[${entry.index}]</div><div><div class="txt">${escapeHtml(entry.text)}</div><div class="meta">p.${entry.page}</div></div></div>`,
+            )
+            .join("");
+        } else {
+          const targetKind = kind === "fig" ? "figure" : kind === "supp" ? "supplementary" : "table";
+          title =
+            kind === "fig"
+              ? "Recognized Figures"
+              : kind === "supp"
+                ? "Recognized Supplementary Figures/Tables"
+                : "Recognized Tables";
+          const targets = repo.listTargetsByKind(docId, targetKind);
+          rows = targets
+            .map((target) => {
+              const caption = normalizeSnippet(typeof target.caption === "string" ? target.caption : "").slice(0, 600);
+              const label = typeof target.label === "string" ? target.label : String(target.label ?? "");
+              const source = typeof target.source === "string" ? target.source : "auto";
+              const confidence = Number.isFinite(target.confidence) ? target.confidence : 0;
+              return `<div class="row"><div class="id">${escapeHtml(label)}</div><div><div class="txt">${escapeHtml(caption)}</div><div class="meta">p.${target.page} | ${escapeHtml(source)} | conf ${confidence.toFixed(2)}</div></div></div>`;
+            })
+            .join("");
+        }
+      } catch (error) {
+        rows = `<div class="empty">Failed to render recognized list: ${escapeHtml(error instanceof Error ? error.message : String(error))}</div>`;
+      }
+
+      const html = `<!doctype html>
+        <html><head><meta charset="utf-8"/><title>${escapeHtml(title)}</title>
+        <style>
+        html,body{margin:0;padding:0;width:100%;height:100%}
+        body{padding:14px;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Helvetica Neue\",Arial,sans-serif;background:#f3f6fa;color:#1e2d3f;overflow:auto}
+        .head{font-size:20px;font-weight:800;margin:0 0 10px}
+        .list{display:flex;flex-direction:column;gap:10px}
+        .row{display:grid;grid-template-columns:100px 1fr;gap:10px;background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px}
+        .id{font-weight:700;color:#26466a;word-break:break-word}
+        .txt{line-height:1.48;white-space:pre-wrap;word-break:break-word}
+        .meta{color:#64748b;font-size:12px;margin-top:4px}
+        .empty{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:12px}
+        </style>
+        </head><body>
+        <div class="head">${escapeHtml(title)}</div>
+        ${rows.includes('class="empty"') ? rows : rows ? `<div class="list">${rows}</div>` : `<div class="empty">No recognized items found.</div>`}
+        </body></html>`;
+
+      try {
+        await popup.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+        return true;
+      } catch {
+        return await loadPopupHtmlFile(popup, "recognized", html);
+      }
+    } catch (error) {
+      console.error("[journal-reader] recognized.openPopup failed:", error);
+      return false;
+    }
   });
 
   ipcMain.handle("figure.openPopup", async (_event, payload: FigurePopupPayload) => {
@@ -827,7 +1176,11 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         docId: payload.docId,
         targetId: payload.targetId,
         page: payload.page,
+        captionPage: payload.captionPage ?? payload.page,
         captionRect: payload.captionRect ?? null,
+        pageRect: payload.pageRect ?? null,
+        focusRect: payload.focusRect ?? null,
+        fullPageMode: Boolean(payload.pageImageDataUrl && payload.pageRect && payload.focusRect),
       }),
     );
 
@@ -835,16 +1188,48 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       <html>
       <head><meta charset=\"utf-8\"/><title>Figure</title>
       <style>
-      html,body{margin:0;padding:0;width:100%;height:100%}
-      body{padding:16px;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Helvetica Neue\",Arial,sans-serif;background:#f3f6fa;color:#1e2d3f;overflow-y:auto}
-      .wrap{display:flex;flex-direction:column;gap:14px}
-      .img-wrap{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px}
-      .img-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+      html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden}
+      *{box-sizing:border-box}
+      body{padding:12px;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"Helvetica Neue\",Arial,sans-serif;background:#f3f6fa;color:#1e2d3f}
+      .wrap{display:grid;grid-template-rows:minmax(0,1fr) auto;gap:12px;height:100%}
+      .img-wrap{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px;display:flex;flex-direction:column;min-height:0;min-width:0}
+      .img-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;min-width:0}
       .img-toolbar button{border:1px solid #c1ccdc;background:#fff;border-radius:8px;padding:5px 10px;cursor:pointer}
       .img-toolbar .zoom{font-size:13px;color:#4d6179;min-width:52px;text-align:right}
-      .img-stage{border:1px solid #d4deea;border-radius:8px;overflow:auto;height:min(68vh,760px);background:#f7f9fc}
-      img{display:block;width:100%;height:auto;object-fit:contain;user-select:none;-webkit-user-drag:none}
-      .cap{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:12px;line-height:1.52;font-size:16px;font-weight:400}
+      .img-toolbar .hint{font-size:12px;color:#5b6d84;flex:1 1 100%;min-width:0;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .tool-group{display:inline-flex;align-items:center;gap:4px;border:1px solid #ccd7e7;border-radius:9px;background:#eef3fa;padding:3px}
+      .tool-group .tool{padding:4px 8px;font-size:12px}
+      .tool-group .tool.active{border-color:#2d5f9e;background:#dce9fb}
+      .swatches{display:inline-flex;align-items:center;gap:5px;margin-left:6px}
+      .swatch{width:16px;height:16px;border-radius:50%;border:1px solid #a5b2c3;padding:0}
+      .swatch.active{box-shadow:0 0 0 2px #2d5f9e}
+      .img-stage{border:1px solid #d4deea;border-radius:8px;overflow:hidden;min-height:0;flex:1;background:#f7f9fc;min-width:0;max-width:100%}
+      .canvas-wrap{position:relative;display:block;width:max-content;height:max-content}
+      img{display:block;max-width:none;max-height:none;user-select:none;-webkit-user-drag:none}
+      .ann-layer{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none}
+      .ann-preview{position:absolute;border:1px dashed #2b5f9f;background:rgba(66,120,203,0.14);pointer-events:none;display:none}
+      .p-ann-interactive{pointer-events:auto}
+      .p-ann-hl{position:absolute;border:none;border-radius:2px;background:rgba(252,229,136,0.42);mix-blend-mode:multiply;padding:0;cursor:pointer}
+      .p-ann-hl:hover{outline:1px solid #d4a20c}
+      .p-ann-text{position:absolute;display:flex;flex-direction:column;gap:4px;padding:0;background:transparent;cursor:move}
+      .p-ann-text .p-ann-toolbar{display:none;align-items:center;gap:6px;padding:3px 5px;border:1px solid #c6cfdd;border-radius:8px;background:#f8fbffeb;width:max-content;box-shadow:0 6px 16px rgba(27,46,78,0.18)}
+      .p-ann-text.focused .p-ann-toolbar{display:inline-flex}
+      .p-ann-toolbar select,.p-ann-toolbar input[type="color"]{height:24px;border:1px solid #c1cad8;border-radius:6px;background:#fff;color:#2d3b4d;font-size:12px}
+      .p-ann-toolbar select{padding:1px 6px}
+      .p-ann-toolbar input[type="color"]{width:28px;padding:0}
+      .p-ann-textarea{min-width:70px;min-height:28px;width:100%;resize:both;border:none;background:transparent;outline:none;line-height:1.12;font-weight:500;padding:0;overflow:hidden;cursor:text}
+      .p-ann-text.focused .p-ann-textarea{box-shadow:0 0 0 1px #2a5fa8 inset;border-radius:4px}
+      .p-ann-textarea::placeholder{color:#7486a0}
+      .p-ann-actions{display:flex;justify-content:flex-end;gap:4px}
+      .p-ann-actions button{width:18px;height:18px;border-radius:7px;padding:0;line-height:16px;font-size:12px}
+      .p-ann-delete{display:inline-flex;align-items:center;justify-content:center;border:1px solid #c5b68f;background:#ffffffcf;color:#7a6042;border-radius:7px;width:18px;height:18px;line-height:16px;padding:0;cursor:pointer}
+      .p-ann-sticky{position:absolute;cursor:move}
+      .p-ann-sticky .icon{width:20px;height:20px;border-radius:50%;border:1px solid #cdbd8b;background:#ffefbb;color:#6b5731;padding:0;line-height:1;cursor:pointer;box-shadow:0 2px 6px rgba(60,56,42,0.2)}
+      .p-ann-sticky .popover{position:absolute;left:24px;top:-8px;width:220px;min-height:120px;border:1px solid #d5c08b;border-radius:10px;background:#fff4ca;box-shadow:0 12px 28px rgba(48,44,31,0.22);padding:6px 8px 8px;display:none;flex-direction:column;gap:6px}
+      .p-ann-sticky:hover .popover,.p-ann-sticky:focus-within .popover{display:flex}
+      .p-ann-sticky-head{display:flex;align-items:center;justify-content:space-between;color:#6e6040;font-size:11px}
+      .p-ann-sticky textarea{width:100%;min-height:84px;resize:vertical;border:none;background:transparent;outline:none;line-height:1.35;padding:0}
+      .cap{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:12px;line-height:1.52;font-size:16px;font-weight:400;max-height:34vh;overflow:auto}
       .cap-head{margin:0 0 8px;font-weight:700}
       .cap-label{font-weight:700}
       .cap-body{margin:0;font-weight:400}
@@ -855,7 +1240,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       .cap-tools button:disabled{opacity:0.5;cursor:not-allowed}
       .cap-hint{font-size:12px;color:#5b6d84}
       </style></head>
-      <body><div class=\"wrap\"><div class=\"img-wrap\"><div class=\"img-toolbar\"><button id=\"zoomOut\" type=\"button\" title=\"Zoom out\">-</button><button id=\"zoomReset\" type=\"button\" title=\"Reset zoom\">100%</button><button id=\"zoomIn\" type=\"button\" title=\"Zoom in\">+</button><div class=\"zoom\" id=\"zoomText\">100%</div></div><div class=\"img-stage\" id=\"imgStage\"><img id=\"targetImage\" src=\"${payload.imageDataUrl}\" alt=\"target\"/></div></div><div class=\"cap\"><div id=\"captionText\">${safeCaptionToHtml(
+      <body><div class=\"wrap\"><div class=\"img-wrap\"><div class=\"img-toolbar\"><button id=\"zoomOut\" type=\"button\" title=\"Zoom out\">-</button><button id=\"zoomReset\" type=\"button\" title=\"Reset zoom\">100%</button><button id=\"zoomIn\" type=\"button\" title=\"Zoom in\">+</button><div class=\"zoom\" id=\"zoomText\">100%</div><div class=\"tool-group\" id=\"annotationTools\"><button id=\"toolPointer\" class=\"tool active\" type=\"button\" title=\"Pointer mode\">Pointer</button><button id=\"toolHighlight\" class=\"tool\" type=\"button\" title=\"Highlight mode\">Highlight</button><button id=\"toolText\" class=\"tool\" type=\"button\" title=\"Text note mode\">Text</button><button id=\"toolSticky\" class=\"tool\" type=\"button\" title=\"Sticky note mode\">Sticky</button></div><div class=\"swatches\" id=\"highlightColors\"><button class=\"swatch active\" data-color=\"#fce588\" type=\"button\" title=\"Yellow highlight\" style=\"background:#fce588\"></button><button class=\"swatch\" data-color=\"#b8f3b4\" type=\"button\" title=\"Green highlight\" style=\"background:#b8f3b4\"></button><button class=\"swatch\" data-color=\"#f9c5e5\" type=\"button\" title=\"Pink highlight\" style=\"background:#f9c5e5\"></button><button class=\"swatch\" data-color=\"#b9d9ff\" type=\"button\" title=\"Blue highlight\" style=\"background:#b9d9ff\"></button></div><div class=\"hint\" id=\"locHint\"></div></div><div class=\"img-stage\" id=\"imgStage\"><div class=\"canvas-wrap\" id=\"canvasWrap\"><img id=\"targetImage\" src=\"${payload.pageImageDataUrl ?? payload.imageDataUrl}\" alt=\"target\"/><div class=\"ann-layer\" id=\"annLayer\"></div><div class=\"ann-preview\" id=\"annPreview\"></div></div></div></div><div class=\"cap\"><div id=\"captionText\">${safeCaptionToHtml(
       payload.caption,
     )}</div><div class=\"cap-tools\"><button id=\"captionHighlight\" type=\"button\" title=\"Create linked highlight from selected caption text\">Highlight Selection</button><button id=\"captionClear\" type=\"button\" title=\"Remove all linked caption highlights for this figure\">Clear Caption Highlights</button><div class=\"cap-hint\" id=\"capHint\">Select text in caption, then click Highlight Selection.</div></div></div></div>
     <script>
@@ -863,44 +1248,697 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         const meta = JSON.parse(decodeURIComponent('${popupMeta}'));
         const api = window.journalApi;
         const stage = document.getElementById('imgStage');
+        const canvasWrap = document.getElementById('canvasWrap');
         const img = document.getElementById('targetImage');
+        const annLayer = document.getElementById('annLayer');
+        const annPreview = document.getElementById('annPreview');
         const zoomText = document.getElementById('zoomText');
         const zoomIn = document.getElementById('zoomIn');
         const zoomOut = document.getElementById('zoomOut');
         const zoomReset = document.getElementById('zoomReset');
+        const locHint = document.getElementById('locHint');
+        const toolPointer = document.getElementById('toolPointer');
+        const toolHighlight = document.getElementById('toolHighlight');
+        const toolText = document.getElementById('toolText');
+        const toolSticky = document.getElementById('toolSticky');
+        const swatchButtons = Array.from(document.querySelectorAll('#highlightColors .swatch'));
         const captionTextEl = document.getElementById('captionText');
         const captionHighlightBtn = document.getElementById('captionHighlight');
         const captionClearBtn = document.getElementById('captionClear');
         const capHint = document.getElementById('capHint');
-        if (!stage || !img || !zoomText || !zoomIn || !zoomOut || !zoomReset || !captionTextEl || !captionHighlightBtn || !captionClearBtn || !capHint) return;
+        if (
+          !stage ||
+          !canvasWrap ||
+          !img ||
+          !annLayer ||
+          !annPreview ||
+          !zoomText ||
+          !zoomIn ||
+          !zoomOut ||
+          !zoomReset ||
+          !locHint ||
+          !toolPointer ||
+          !toolHighlight ||
+          !toolText ||
+          !toolSticky ||
+          !captionTextEl ||
+          !captionHighlightBtn ||
+          !captionClearBtn ||
+          !capHint
+        ) return;
 
         let scale = 1;
+        let initialScale = 1;
+        let baseFitScale = 1;
+        let baseDisplayWidth = 1;
+        let baseDisplayHeight = 1;
         const minScale = 0.5;
-        const maxScale = 5;
+        const maxScale = 3.2;
+        let toolMode = 'pointer';
+        let highlightColor = '#fce588';
         const originalCaptionHtml = captionTextEl.innerHTML;
         let linkedSnippets = [];
         let articleSnippets = [];
         let lastSelectionSnippet = '';
+        let panDragging = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+        let dragStartScrollLeft = 0;
+        let dragStartScrollTop = 0;
+        let noteDrag = null;
+        let highlightDrag = null;
+        let suppressClick = false;
+        let pageAnnotations = [];
+        let wheelThrottleRaf = null;
+        let wheelPending = null;
 
-        const clamp = (v) => Math.max(minScale, Math.min(maxScale, v));
+        const hasAnnotationApi =
+          Boolean(api) &&
+          typeof api.annotationList === 'function' &&
+          typeof api.annotationCreate === 'function' &&
+          typeof api.annotationUpdate === 'function' &&
+          typeof api.annotationDelete === 'function';
+        const canEditPageAnnotations = Boolean(hasAnnotationApi && meta.docId && meta.pageRect);
+        const pageRect = meta.pageRect || null;
+        const focusRect = meta.focusRect || null;
+        const canUseFocusRect = (() => {
+          if (!meta.fullPageMode || !pageRect || !focusRect) {
+            return false;
+          }
+          const pageW = Math.max(1, Number(pageRect.w) || 1);
+          const pageH = Math.max(1, Number(pageRect.h) || 1);
+          const fx = Number(focusRect.x);
+          const fy = Number(focusRect.y);
+          const fw = Math.max(1, Number(focusRect.w) || 1);
+          const fh = Math.max(1, Number(focusRect.h) || 1);
+          if (!Number.isFinite(fx) || !Number.isFinite(fy) || !Number.isFinite(fw) || !Number.isFinite(fh)) {
+            return false;
+          }
+          const areaRatio = (fw * fh) / (pageW * pageH);
+          const widthRatio = fw / pageW;
+          const heightRatio = fh / pageH;
+          if (areaRatio < 0.02 || areaRatio > 0.9) {
+            return false;
+          }
+          if (widthRatio < 0.08 || heightRatio < 0.08) {
+            return false;
+          }
+          return true;
+        })();
+        const minViewRectSize = 4;
+        const NOTE_FONTS = [
+          { label: 'SF Pro', value: '"SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif' },
+          { label: 'Times', value: '"Times New Roman", Times, serif' },
+          { label: 'Helvetica', value: '"Helvetica Neue", Helvetica, Arial, sans-serif' },
+          { label: 'Menlo', value: 'Menlo, Monaco, monospace' },
+        ];
+        const NOTE_FONT_SIZES = [16, 20, 24, 28, 32, 40];
+        const normalizeNoteStyle = (annotation) => {
+          const style = annotation.style || {};
+          const fallbackColor = annotation.kind === 'text-note' ? '#db4638' : '#29384b';
+          const fallbackSize = annotation.kind === 'text-note' ? 28 : 13;
+          return {
+            fontSize: Number.isFinite(style.fontSize) ? Math.max(10, Math.min(72, style.fontSize)) : fallbackSize,
+            fontFamily: style.fontFamily || NOTE_FONTS[0].value,
+            textColor: style.textColor || fallbackColor,
+          };
+        };
+
+        const clampScale = (v) => Math.max(minScale, Math.min(maxScale, v));
+        const clampScroll = (value, max) => Math.max(0, Math.min(max, value));
+        const WHEEL_DELTA_CAP = 56;
+        const getDisplaySize = () => ({
+          w: Math.max(1, img.clientWidth || 1),
+          h: Math.max(1, img.clientHeight || 1),
+        });
+        const clampPointToImage = (point) => {
+          const size = getDisplaySize();
+          return {
+            x: Math.max(0, Math.min(size.w, point.x)),
+            y: Math.max(0, Math.min(size.h, point.y)),
+          };
+        };
+        const clientToViewPoint = (clientX, clientY) => {
+          const rect = canvasWrap.getBoundingClientRect();
+          return clampPointToImage({ x: clientX - rect.left, y: clientY - rect.top });
+        };
+        const normalizeViewRect = (a, b) => {
+          const x = Math.min(a.x, b.x);
+          const y = Math.min(a.y, b.y);
+          const w = Math.max(1, Math.abs(a.x - b.x));
+          const h = Math.max(1, Math.abs(a.y - b.y));
+          return { x, y, w, h };
+        };
+        const pdfRectToViewRect = (rect) => {
+          if (!pageRect) return null;
+          const size = getDisplaySize();
+          const pageW = Math.max(1, pageRect.w);
+          const pageH = Math.max(1, pageRect.h);
+          const leftRatio = (rect.x - pageRect.x) / pageW;
+          const rightRatio = (rect.x + rect.w - pageRect.x) / pageW;
+          const topRatio = (pageRect.y + pageRect.h - (rect.y + rect.h)) / pageH;
+          const bottomRatio = (pageRect.y + pageRect.h - rect.y) / pageH;
+          const x0 = Math.min(leftRatio, rightRatio) * size.w;
+          const x1 = Math.max(leftRatio, rightRatio) * size.w;
+          const y0 = Math.min(topRatio, bottomRatio) * size.h;
+          const y1 = Math.max(topRatio, bottomRatio) * size.h;
+          return { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) };
+        };
+        const viewRectToPdfRect = (rect) => {
+          if (!pageRect) return null;
+          const size = getDisplaySize();
+          const pageW = Math.max(1, pageRect.w);
+          const pageH = Math.max(1, pageRect.h);
+          const left = pageRect.x + (rect.x / size.w) * pageW;
+          const right = pageRect.x + ((rect.x + rect.w) / size.w) * pageW;
+          const top = pageRect.y + pageH * (1 - rect.y / size.h);
+          const bottom = pageRect.y + pageH * (1 - (rect.y + rect.h) / size.h);
+          const x = Math.min(left, right);
+          const y = Math.min(bottom, top);
+          const w = Math.max(1, Math.abs(right - left));
+          const h = Math.max(1, Math.abs(top - bottom));
+          return { x, y, w, h };
+        };
+        const viewPointToPdfPoint = (point) => {
+          if (!pageRect) return null;
+          const size = getDisplaySize();
+          const pageW = Math.max(1, pageRect.w);
+          const pageH = Math.max(1, pageRect.h);
+          return {
+            x: pageRect.x + (point.x / size.w) * pageW,
+            y: pageRect.y + pageH * (1 - point.y / size.h),
+          };
+        };
+        const syncHighlightSwatches = () => {
+          for (const btn of swatchButtons) {
+            const color = btn.dataset.color || '';
+            btn.classList.toggle('active', color === highlightColor);
+            btn.disabled = !canEditPageAnnotations;
+          }
+        };
+        const setStatusHint = (text) => {
+          if (text) {
+            locHint.textContent = text;
+            return;
+          }
+          if (!canEditPageAnnotations) {
+            locHint.textContent = 'Preview mode: page annotations are unavailable in this popup.';
+            return;
+          }
+          if (toolMode === 'highlight') {
+            locHint.textContent = 'Highlight mode: drag to create highlight on figure page.';
+            return;
+          }
+          if (toolMode === 'text-note') {
+            locHint.textContent = 'Text note mode: click to place a text note.';
+            return;
+          }
+          if (toolMode === 'sticky-note') {
+            locHint.textContent = 'Sticky mode: click to place a sticky note.';
+            return;
+          }
+          locHint.textContent = meta.fullPageMode
+            ? 'Full-page preview.'
+            : 'Pointer mode';
+        };
+        const applyToolUi = () => {
+          toolPointer.classList.toggle('active', toolMode === 'pointer');
+          toolHighlight.classList.toggle('active', toolMode === 'highlight');
+          toolText.classList.toggle('active', toolMode === 'text-note');
+          toolSticky.classList.toggle('active', toolMode === 'sticky-note');
+          toolPointer.disabled = !canEditPageAnnotations;
+          toolHighlight.disabled = !canEditPageAnnotations;
+          toolText.disabled = !canEditPageAnnotations;
+          toolSticky.disabled = !canEditPageAnnotations;
+          syncHighlightSwatches();
+          setStatusHint('');
+        };
+        const setToolMode = (mode) => {
+          if (!canEditPageAnnotations) return;
+          toolMode = mode;
+          applyToolUi();
+          setStageCursor();
+        };
+        const updatePreviewRect = () => {
+          if (!highlightDrag) {
+            annPreview.style.display = 'none';
+            return;
+          }
+          const rect = normalizeViewRect(highlightDrag.start, highlightDrag.current);
+          annPreview.style.display = rect.w >= 1 && rect.h >= 1 ? 'block' : 'none';
+          annPreview.style.left = rect.x + 'px';
+          annPreview.style.top = rect.y + 'px';
+          annPreview.style.width = rect.w + 'px';
+          annPreview.style.height = rect.h + 'px';
+        };
+        const upsertLocalAnnotation = (updated) => {
+          const idx = pageAnnotations.findIndex((item) => item.id === updated.id);
+          if (idx >= 0) {
+            pageAnnotations[idx] = updated;
+            return;
+          }
+          pageAnnotations.push(updated);
+          pageAnnotations.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+        };
+        const removeLocalAnnotation = (id) => {
+          pageAnnotations = pageAnnotations.filter((item) => item.id !== id);
+        };
+        const commitAnnotationUpdate = async (id, patch) => {
+          if (!hasAnnotationApi) return;
+          const updated = await api.annotationUpdate({ id, ...patch });
+          if (updated) {
+            upsertLocalAnnotation(updated);
+            renderPageAnnotations();
+          }
+        };
+        const renderPageAnnotations = () => {
+          while (annLayer.firstChild) {
+            annLayer.removeChild(annLayer.firstChild);
+          }
+          if (!canEditPageAnnotations) {
+            return;
+          }
+          for (const annotation of pageAnnotations) {
+            if (annotation.kind === 'highlight') {
+              for (let i = 0; i < (annotation.rects || []).length; i += 1) {
+                const rect = annotation.rects[i];
+                const viewRect = pdfRectToViewRect(rect);
+                if (!viewRect) continue;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'p-ann-hl p-ann-interactive';
+                btn.dataset.annId = annotation.id;
+                btn.style.left = viewRect.x + 'px';
+                btn.style.top = viewRect.y + 'px';
+                btn.style.width = viewRect.w + 'px';
+                btn.style.height = viewRect.h + 'px';
+                btn.style.background = annotation.color || '#fce588';
+                btn.title = 'Click to delete highlight';
+                btn.addEventListener('mousedown', (event) => {
+                  event.stopPropagation();
+                });
+                btn.addEventListener('click', async (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!hasAnnotationApi) return;
+                  const ok = window.confirm('Delete this highlight?');
+                  if (!ok) return;
+                  const deleted = await api.annotationDelete(annotation.id);
+                  if (deleted) {
+                    removeLocalAnnotation(annotation.id);
+                    renderPageAnnotations();
+                  }
+                });
+                annLayer.appendChild(btn);
+              }
+              continue;
+            }
+
+            const anchor = annotation.rects && annotation.rects[0];
+            if (!anchor) continue;
+            const viewRect = pdfRectToViewRect(anchor);
+            if (!viewRect) continue;
+
+            if (annotation.kind === 'text-note') {
+              const styleState = normalizeNoteStyle(annotation);
+              const wrap = document.createElement('div');
+              wrap.className = 'p-ann-text p-ann-interactive';
+              wrap.dataset.annId = annotation.id;
+              wrap.style.left = viewRect.x + 'px';
+              wrap.style.top = viewRect.y + 'px';
+              wrap.style.width = Math.max(72, viewRect.w) + 'px';
+              wrap.style.minHeight = Math.max(28, viewRect.h) + 'px';
+              const toolbar = document.createElement('div');
+              toolbar.className = 'p-ann-toolbar';
+
+              const sizeSelect = document.createElement('select');
+              sizeSelect.title = 'Font size';
+              for (const size of NOTE_FONT_SIZES) {
+                const option = document.createElement('option');
+                option.value = String(size);
+                option.textContent = size + 'px';
+                if (size === styleState.fontSize) {
+                  option.selected = true;
+                }
+                sizeSelect.appendChild(option);
+              }
+
+              const familySelect = document.createElement('select');
+              familySelect.title = 'Font family';
+              for (const font of NOTE_FONTS) {
+                const option = document.createElement('option');
+                option.value = font.value;
+                option.textContent = font.label;
+                if (font.value === styleState.fontFamily) {
+                  option.selected = true;
+                }
+                familySelect.appendChild(option);
+              }
+
+              const colorInput = document.createElement('input');
+              colorInput.type = 'color';
+              colorInput.title = 'Text color';
+              colorInput.value = styleState.textColor;
+
+              const deleteBtn = document.createElement('button');
+              deleteBtn.type = 'button';
+              deleteBtn.className = 'p-ann-delete';
+              deleteBtn.textContent = '×';
+              deleteBtn.title = 'Delete text note';
+              deleteBtn.addEventListener('click', async (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!hasAnnotationApi) return;
+                const deleted = await api.annotationDelete(annotation.id);
+                if (deleted) {
+                  removeLocalAnnotation(annotation.id);
+                  renderPageAnnotations();
+                }
+              });
+
+              toolbar.appendChild(sizeSelect);
+              toolbar.appendChild(familySelect);
+              toolbar.appendChild(colorInput);
+              toolbar.appendChild(deleteBtn);
+              wrap.appendChild(toolbar);
+
+              const textarea = document.createElement('textarea');
+              textarea.className = 'p-ann-textarea';
+              textarea.value = annotation.text || '';
+              textarea.placeholder = 'Text';
+              const applyTextStyle = () => {
+                textarea.style.fontSize = styleState.fontSize + 'px';
+                textarea.style.fontFamily = styleState.fontFamily;
+                textarea.style.color = styleState.textColor;
+              };
+              applyTextStyle();
+              const commitStyle = () => {
+                void commitAnnotationUpdate(annotation.id, {
+                  style: {
+                    fontSize: styleState.fontSize,
+                    fontFamily: styleState.fontFamily,
+                    textColor: styleState.textColor,
+                  },
+                });
+              };
+              textarea.addEventListener('mousedown', (event) => {
+                event.stopPropagation();
+              });
+              textarea.addEventListener('focus', () => {
+                wrap.classList.add('focused');
+              });
+              textarea.addEventListener('blur', () => {
+                queueMicrotask(() => {
+                  if (!wrap.contains(document.activeElement)) {
+                    wrap.classList.remove('focused');
+                  }
+                });
+                const nextRect = viewRectToPdfRect({
+                  x: parseFloat(wrap.style.left || '0'),
+                  y: parseFloat(wrap.style.top || '0'),
+                  w: Math.max(72, textarea.getBoundingClientRect().width),
+                  h: Math.max(28, textarea.getBoundingClientRect().height),
+                });
+                const patch = { text: textarea.value };
+                if (nextRect) {
+                  patch.rects = [nextRect];
+                }
+                void commitAnnotationUpdate(annotation.id, patch);
+              });
+              wrap.appendChild(textarea);
+
+              sizeSelect.addEventListener('mousedown', (event) => event.stopPropagation());
+              familySelect.addEventListener('mousedown', (event) => event.stopPropagation());
+              colorInput.addEventListener('mousedown', (event) => event.stopPropagation());
+              deleteBtn.addEventListener('mousedown', (event) => event.stopPropagation());
+              sizeSelect.addEventListener('focus', () => wrap.classList.add('focused'));
+              familySelect.addEventListener('focus', () => wrap.classList.add('focused'));
+              colorInput.addEventListener('focus', () => wrap.classList.add('focused'));
+              sizeSelect.addEventListener('change', (event) => {
+                const next = Number(event.target.value);
+                if (!Number.isFinite(next)) return;
+                styleState.fontSize = Math.max(10, Math.min(72, next));
+                applyTextStyle();
+                commitStyle();
+              });
+              familySelect.addEventListener('change', (event) => {
+                styleState.fontFamily = event.target.value || NOTE_FONTS[0].value;
+                applyTextStyle();
+                commitStyle();
+              });
+              colorInput.addEventListener('input', (event) => {
+                styleState.textColor = event.target.value || '#db4638';
+                applyTextStyle();
+                commitStyle();
+              });
+
+              wrap.addEventListener('mousedown', (event) => {
+                event.stopPropagation();
+                if (event.button !== 0 || toolMode !== 'pointer') return;
+                const target = event.target instanceof HTMLElement ? event.target : null;
+                if (target?.closest('textarea,button,input,select,option')) return;
+                noteDrag = {
+                  id: annotation.id,
+                  startClientX: event.clientX,
+                  startClientY: event.clientY,
+                  startRects: annotation.rects.map((item) => ({ ...item })),
+                };
+                event.preventDefault();
+              });
+
+              annLayer.appendChild(wrap);
+              continue;
+            }
+
+            const sticky = document.createElement('div');
+            sticky.className = 'p-ann-sticky p-ann-interactive';
+            sticky.dataset.annId = annotation.id;
+            sticky.style.left = viewRect.x + 'px';
+            sticky.style.top = viewRect.y + 'px';
+            sticky.style.width = Math.max(18, viewRect.w) + 'px';
+            sticky.style.height = Math.max(18, viewRect.h) + 'px';
+
+            const icon = document.createElement('button');
+            icon.type = 'button';
+            icon.className = 'icon';
+            icon.textContent = '🗒';
+            icon.title = 'Sticky note';
+            icon.addEventListener('mousedown', (event) => {
+              event.stopPropagation();
+            });
+            sticky.appendChild(icon);
+
+            const pop = document.createElement('div');
+            pop.className = 'popover';
+            const head = document.createElement('div');
+            head.className = 'p-ann-sticky-head';
+            const title = document.createElement('span');
+            title.textContent = 'Sticky note';
+            const actions = document.createElement('div');
+            actions.className = 'p-ann-actions';
+            const deleteBtn = document.createElement('button');
+            deleteBtn.type = 'button';
+            deleteBtn.className = 'p-ann-delete';
+            deleteBtn.textContent = '×';
+            deleteBtn.title = 'Delete sticky note';
+            deleteBtn.addEventListener('click', async (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              if (!hasAnnotationApi) return;
+              const deleted = await api.annotationDelete(annotation.id);
+              if (deleted) {
+                removeLocalAnnotation(annotation.id);
+                renderPageAnnotations();
+              }
+            });
+            actions.appendChild(deleteBtn);
+            head.appendChild(title);
+            head.appendChild(actions);
+            pop.appendChild(head);
+
+            const textarea = document.createElement('textarea');
+            textarea.value = annotation.text || '';
+            textarea.placeholder = 'Add note...';
+            const style = normalizeNoteStyle(annotation);
+            textarea.style.fontSize = style.fontSize + 'px';
+            textarea.style.fontFamily = style.fontFamily;
+            textarea.style.color = style.textColor;
+            textarea.addEventListener('mousedown', (event) => {
+              event.stopPropagation();
+            });
+            textarea.addEventListener('blur', () => {
+              void commitAnnotationUpdate(annotation.id, { text: textarea.value });
+            });
+            pop.appendChild(textarea);
+            sticky.appendChild(pop);
+
+            sticky.addEventListener('mousedown', (event) => {
+              event.stopPropagation();
+              if (event.button !== 0 || toolMode !== 'pointer') return;
+              const target = event.target instanceof HTMLElement ? event.target : null;
+              if (target?.closest('textarea,button,input,select,option')) return;
+              noteDrag = {
+                id: annotation.id,
+                startClientX: event.clientX,
+                startClientY: event.clientY,
+                startRects: annotation.rects.map((item) => ({ ...item })),
+              };
+              event.preventDefault();
+            });
+
+            annLayer.appendChild(sticky);
+          }
+        };
+        const loadPageAnnotations = async () => {
+          if (!canEditPageAnnotations) return;
+          const list = await api.annotationList(meta.docId);
+          pageAnnotations = (Array.isArray(list) ? list : []).filter((item) => item.page === meta.page);
+          renderPageAnnotations();
+        };
+        const setStageCursor = () => {
+          if (noteDrag) {
+            stage.style.cursor = 'grabbing';
+            return;
+          }
+          if (highlightDrag || toolMode === 'highlight') {
+            stage.style.cursor = 'crosshair';
+            return;
+          }
+          if (panDragging) {
+            stage.style.cursor = 'grabbing';
+            return;
+          }
+          if (toolMode === 'text-note' || toolMode === 'sticky-note') {
+            stage.style.cursor = 'copy';
+            return;
+          }
+          stage.style.cursor = meta.fullPageMode || scale > 1.001 ? 'grab' : 'default';
+        };
+        const computeBaseDisplaySize = () => {
+          const naturalWidth = img.naturalWidth || 1;
+          const naturalHeight = img.naturalHeight || 1;
+          const stageWidth = Math.max(1, stage.clientWidth - 2);
+          const stageHeight = Math.max(1, stage.clientHeight - 2);
+          const fitByContain = Math.min(stageWidth / naturalWidth, stageHeight / naturalHeight);
+          const fitByWidth = stageWidth / naturalWidth;
+          const computedFit = meta.fullPageMode ? fitByWidth : fitByContain;
+          baseFitScale = Number.isFinite(computedFit) && computedFit > 0 ? computedFit : 1;
+          baseDisplayWidth = Math.max(1, Math.round(naturalWidth * baseFitScale));
+          baseDisplayHeight = Math.max(1, Math.round(naturalHeight * baseFitScale));
+        };
+
         const render = () => {
-          img.style.width = (scale * 100).toFixed(3) + '%';
+          const displayWidth = Math.max(1, Math.round(baseDisplayWidth * scale));
+          const displayHeight = Math.max(1, Math.round(baseDisplayHeight * scale));
+          img.style.width = displayWidth + 'px';
+          img.style.height = displayHeight + 'px';
+          canvasWrap.style.width = img.style.width;
+          canvasWrap.style.height = img.style.height;
+          const allowScroll = meta.fullPageMode || scale > 1.001;
+          stage.style.overflow = allowScroll ? 'auto' : 'hidden';
+          stage.style.overflowX = allowScroll ? 'auto' : 'hidden';
+          stage.style.overflowY = allowScroll ? 'auto' : 'hidden';
+          setStageCursor();
           const pct = Math.round(scale * 100);
           zoomText.textContent = pct + '%';
           zoomReset.textContent = pct + '%';
+          setStatusHint('');
+          renderPageAnnotations();
+          updatePreviewRect();
         };
 
-        const zoomAt = (nextScale, offsetX, offsetY) => {
-          const target = clamp(nextScale);
+        const centerOnFocusRect = () => {
+          if (!canUseFocusRect || !pageRect || !focusRect) {
+            return;
+          }
+          const pageW = Math.max(1, pageRect.w);
+          const pageH = Math.max(1, pageRect.h);
+          const normX = (focusRect.x - pageRect.x) / pageW;
+          const normW = focusRect.w / pageW;
+          const normTop = (pageRect.y + pageRect.h - (focusRect.y + focusRect.h)) / pageH;
+          const normH = focusRect.h / pageH;
+          const displayW = img.clientWidth || 1;
+          const displayH = img.clientHeight || 1;
+          const focusX = normX * displayW;
+          const focusY = normTop * displayH;
+          const focusW = Math.max(1, normW * displayW);
+          const focusH = Math.max(1, normH * displayH);
+          const targetLeft = focusX + focusW * 0.5 - stage.clientWidth * 0.5;
+          const targetTop = focusY + focusH * 0.5 - stage.clientHeight * 0.5;
+          stage.scrollLeft = clampScroll(targetLeft, Math.max(0, displayW - stage.clientWidth));
+          stage.scrollTop = clampScroll(targetTop, Math.max(0, displayH - stage.clientHeight));
+        };
+
+        const computeInitialScale = () => {
+          if (!canUseFocusRect || !pageRect || !focusRect) {
+            return 1;
+          }
+          const pageW = Math.max(1, pageRect.w);
+          const pageH = Math.max(1, pageRect.h);
+          const focusW = Math.max(0.02, focusRect.w / pageW);
+          const focusH = Math.max(0.02, focusRect.h / pageH);
+          const naturalWidth = img.naturalWidth || 1;
+          const naturalHeight = img.naturalHeight || 1;
+          const stageWidth = Math.max(1, stage.clientWidth - 2);
+          const stageHeight = Math.max(1, stage.clientHeight - 2);
+          const targetAbsolute = Math.min(
+            stageWidth / Math.max(1, naturalWidth * focusW * 1.18),
+            stageHeight / Math.max(1, naturalHeight * focusH * 1.18),
+          );
+          const safeFitScale = Math.max(0.0001, baseFitScale);
+          const relative = targetAbsolute / safeFitScale;
+          return clampScale(Math.max(0.95, Math.min(1.02, relative)));
+        };
+
+        const zoomAt = (nextScale, offsetX, offsetY, snapToFocus = false) => {
+          const target = clampScale(nextScale);
           if (Math.abs(target - scale) < 0.0001) return;
-          const ratio = target / scale;
-          const nextScrollLeft = (stage.scrollLeft + offsetX) * ratio - offsetX;
-          const nextScrollTop = (stage.scrollTop + offsetY) * ratio - offsetY;
+          if (!Number.isFinite(target)) return;
+          const safeOffsetX = Number.isFinite(offsetX) ? offsetX : stage.clientWidth * 0.5;
+          const safeOffsetY = Number.isFinite(offsetY) ? offsetY : stage.clientHeight * 0.5;
+          const beforeContentWidth = Math.max(
+            stage.clientWidth,
+            stage.scrollWidth,
+            canvasWrap.clientWidth || 0,
+            img.clientWidth || 0,
+            1,
+          );
+          const beforeContentHeight = Math.max(
+            stage.clientHeight,
+            stage.scrollHeight,
+            canvasWrap.clientHeight || 0,
+            img.clientHeight || 0,
+            1,
+          );
+          const anchorX = clampScroll((stage.scrollLeft + safeOffsetX) / beforeContentWidth, 1);
+          const anchorY = clampScroll((stage.scrollTop + safeOffsetY) / beforeContentHeight, 1);
           scale = target;
           render();
           requestAnimationFrame(() => {
-            stage.scrollLeft = nextScrollLeft;
-            stage.scrollTop = nextScrollTop;
+            if (snapToFocus && meta.fullPageMode && meta.focusRect) {
+              centerOnFocusRect();
+              return;
+            }
+            const afterContentWidth = Math.max(
+              stage.clientWidth,
+              stage.scrollWidth,
+              canvasWrap.clientWidth || 0,
+              img.clientWidth || 0,
+              1,
+            );
+            const afterContentHeight = Math.max(
+              stage.clientHeight,
+              stage.scrollHeight,
+              canvasWrap.clientHeight || 0,
+              img.clientHeight || 0,
+              1,
+            );
+            const nextScrollLeft = anchorX * afterContentWidth - safeOffsetX;
+            const nextScrollTop = anchorY * afterContentHeight - safeOffsetY;
+            const maxLeft = Math.max(0, stage.scrollWidth - stage.clientWidth);
+            const maxTop = Math.max(0, stage.scrollHeight - stage.clientHeight);
+            stage.scrollLeft = clampScroll(Number.isFinite(nextScrollLeft) ? nextScrollLeft : 0, maxLeft);
+            stage.scrollTop = clampScroll(Number.isFinite(nextScrollTop) ? nextScrollTop : 0, maxTop);
           });
         };
 
@@ -988,7 +2026,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           await api.captionSyncHighlights({
             docId: meta.docId,
             targetId: meta.targetId,
-            page: meta.page,
+            page: meta.captionPage || meta.page,
             captionRect: meta.captionRect,
             snippets: linkedSnippets,
           });
@@ -999,7 +2037,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           const result = await api.captionGetLinkedSnippets({
             docId: meta.docId,
             targetId: meta.targetId,
-            page: meta.page,
+            page: meta.captionPage || meta.page,
             captionRect: meta.captionRect,
           });
           linkedSnippets = result?.linkedSnippets || [];
@@ -1026,28 +2064,287 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           }
         };
 
-        stage.addEventListener('wheel', (event) => {
-          if (!event.ctrlKey) return;
+        toolPointer.addEventListener('click', () => setToolMode('pointer'));
+        toolHighlight.addEventListener('click', () => setToolMode('highlight'));
+        toolText.addEventListener('click', () => setToolMode('text-note'));
+        toolSticky.addEventListener('click', () => setToolMode('sticky-note'));
+        for (const swatch of swatchButtons) {
+          swatch.addEventListener('click', () => {
+            if (!canEditPageAnnotations) return;
+            const next = swatch.dataset.color || '';
+            if (!next) return;
+            highlightColor = next;
+            syncHighlightSwatches();
+          });
+        }
+
+        const onGlobalWheel = (event) => {
+          if (!event.ctrlKey && !event.metaKey) return;
+          if (stage.contains(event.target)) {
+            return;
+          }
           event.preventDefault();
-          const rect = stage.getBoundingClientRect();
-          const x = event.clientX - rect.left;
-          const y = event.clientY - rect.top;
-          const factor = Math.exp(-event.deltaY * 0.0025);
-          zoomAt(scale * factor, x, y);
+          event.stopPropagation();
+        };
+        const onGlobalGesture = (event) => {
+          event.preventDefault();
+        };
+        document.addEventListener('wheel', onGlobalWheel, { passive: false, capture: true });
+        window.addEventListener('gesturestart', onGlobalGesture, { passive: false });
+        window.addEventListener('gesturechange', onGlobalGesture, { passive: false });
+        window.addEventListener('gestureend', onGlobalGesture, { passive: false });
+
+        stage.addEventListener('wheel', (event) => {
+          if (!event.ctrlKey) {
+            const maxLeft = Math.max(0, stage.scrollWidth - stage.clientWidth);
+            const hasHorizontalOverflow = maxLeft > 0;
+            const horizontalIntent = Math.abs(event.deltaX) > 0.01 || event.shiftKey;
+            if (!hasHorizontalOverflow || !horizontalIntent) return;
+            const rawDx = Math.abs(event.deltaX) > 0.01 ? event.deltaX : event.deltaY;
+            const dx = Number.isFinite(rawDx) ? rawDx : 0;
+            const nextLeft = clampScroll(stage.scrollLeft + dx, maxLeft);
+            if (Math.abs(nextLeft - stage.scrollLeft) > 0.001) {
+              stage.scrollLeft = nextLeft;
+              event.preventDefault();
+              event.stopPropagation();
+            }
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          wheelPending = {
+            deltaY: event.deltaY,
+            clientX: event.clientX,
+            clientY: event.clientY,
+          };
+          if (wheelThrottleRaf !== null) {
+            return;
+          }
+          wheelThrottleRaf = window.requestAnimationFrame(() => {
+            wheelThrottleRaf = null;
+            const pending = wheelPending;
+            wheelPending = null;
+            if (!pending) return;
+            const currentScale = scale;
+            const delta = Math.max(-WHEEL_DELTA_CAP, Math.min(WHEEL_DELTA_CAP, pending.deltaY));
+            if (Math.abs(delta) < 0.001) return;
+            if ((currentScale >= maxScale - 0.0001 && delta < 0) || (currentScale <= minScale + 0.0001 && delta > 0)) {
+              return;
+            }
+            const gain = currentScale > 1 ? 0.0011 : 0.0013;
+            const zoomFactor = Math.exp(-delta * gain);
+            const nextScale = clampScale(currentScale * zoomFactor);
+            if (Math.abs(nextScale - currentScale) < 0.0005) return;
+            const rect = stage.getBoundingClientRect();
+            const offsetX = pending.clientX - rect.left;
+            const offsetY = pending.clientY - rect.top;
+            zoomAt(nextScale, offsetX, offsetY);
+          });
         }, { passive: false });
 
         zoomIn.addEventListener('click', () => {
-          zoomAt(scale + 0.15, stage.clientWidth * 0.5, stage.clientHeight * 0.5);
+          zoomAt(scale + 0.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
         });
         zoomOut.addEventListener('click', () => {
-          zoomAt(scale - 0.15, stage.clientWidth * 0.5, stage.clientHeight * 0.5);
+          zoomAt(scale - 0.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
         });
         zoomReset.addEventListener('click', () => {
-          scale = 1;
+          scale = initialScale;
           render();
-          stage.scrollLeft = 0;
-          stage.scrollTop = 0;
+          if (canUseFocusRect) {
+            centerOnFocusRect();
+          } else {
+            stage.scrollLeft = 0;
+            stage.scrollTop = 0;
+          }
         });
+
+        const onImageLoad = () => {
+          computeBaseDisplaySize();
+          scale = 1;
+          initialScale = computeInitialScale();
+          scale = initialScale;
+          render();
+          if (canUseFocusRect) {
+            centerOnFocusRect();
+          } else {
+            stage.scrollLeft = 0;
+            stage.scrollTop = 0;
+          }
+          void loadPageAnnotations();
+        };
+        img.addEventListener('load', onImageLoad);
+        if (img.complete && (img.naturalWidth || 0) > 0) {
+          onImageLoad();
+        }
+
+        const resizeObserver = new ResizeObserver(() => {
+          if (scale > 1.001) {
+            stage.scrollLeft = clampScroll(stage.scrollLeft, Math.max(0, stage.scrollWidth - stage.clientWidth));
+            stage.scrollTop = clampScroll(stage.scrollTop, Math.max(0, stage.scrollHeight - stage.clientHeight));
+            return;
+          }
+          const beforeWidth = Math.max(1, img.clientWidth || 1);
+          const beforeHeight = Math.max(1, img.clientHeight || 1);
+          const centerX = (stage.scrollLeft + stage.clientWidth * 0.5) / beforeWidth;
+          const centerY = (stage.scrollTop + stage.clientHeight * 0.5) / beforeHeight;
+          computeBaseDisplaySize();
+          render();
+          if (canUseFocusRect) {
+            centerOnFocusRect();
+            return;
+          }
+          const afterWidth = Math.max(1, img.clientWidth || 1);
+          const afterHeight = Math.max(1, img.clientHeight || 1);
+          const nextScrollLeft = centerX * afterWidth - stage.clientWidth * 0.5;
+          const nextScrollTop = centerY * afterHeight - stage.clientHeight * 0.5;
+          stage.scrollLeft = clampScroll(nextScrollLeft, Math.max(0, stage.scrollWidth - stage.clientWidth));
+          stage.scrollTop = clampScroll(nextScrollTop, Math.max(0, stage.scrollHeight - stage.clientHeight));
+        });
+        resizeObserver.observe(stage);
+
+        stage.addEventListener('mousedown', (event) => {
+          if (event.button !== 0) return;
+          const target = event.target instanceof HTMLElement ? event.target : null;
+          if (target?.closest('.p-ann-interactive')) {
+            return;
+          }
+          if (canEditPageAnnotations && toolMode === 'highlight') {
+            const start = clientToViewPoint(event.clientX, event.clientY);
+            highlightDrag = { start, current: start };
+            updatePreviewRect();
+            setStageCursor();
+            event.preventDefault();
+            return;
+          }
+          if (!meta.fullPageMode && scale <= 1.001) return;
+          panDragging = true;
+          dragStartX = event.clientX;
+          dragStartY = event.clientY;
+          dragStartScrollLeft = stage.scrollLeft;
+          dragStartScrollTop = stage.scrollTop;
+          setStageCursor();
+          event.preventDefault();
+        });
+        stage.addEventListener('click', async (event) => {
+          if (suppressClick) {
+            suppressClick = false;
+            return;
+          }
+          if (!canEditPageAnnotations || (toolMode !== 'text-note' && toolMode !== 'sticky-note')) return;
+          const target = event.target instanceof HTMLElement ? event.target : null;
+          if (target?.closest('.p-ann-interactive')) return;
+          const point = clientToViewPoint(event.clientX, event.clientY);
+          const pdfPoint = viewPointToPdfPoint(point);
+          if (!pdfPoint) return;
+          if (toolMode === 'text-note') {
+            await api.annotationCreate({
+              docId: meta.docId,
+              page: meta.page,
+              kind: 'text-note',
+              rects: [{ x: pdfPoint.x, y: pdfPoint.y, w: 180, h: 46 }],
+              text: '',
+              style: {
+                fontSize: 28,
+                fontFamily: '"SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif',
+                textColor: '#db4638',
+              },
+            });
+            setToolMode('pointer');
+            return;
+          }
+          await api.annotationCreate({
+            docId: meta.docId,
+            page: meta.page,
+            kind: 'sticky-note',
+            rects: [{ x: pdfPoint.x, y: pdfPoint.y, w: 22, h: 22 }],
+            text: '',
+            style: {
+              fontSize: 13,
+              fontFamily: '"SF Pro Text", -apple-system, BlinkMacSystemFont, sans-serif',
+              textColor: '#29384b',
+            },
+          });
+          setToolMode('pointer');
+        });
+
+        const onWindowMouseMove = (event) => {
+          if (noteDrag) {
+            const dx = event.clientX - noteDrag.startClientX;
+            const dy = event.clientY - noteDrag.startClientY;
+            const targets = annLayer.querySelectorAll('[data-ann-id="' + noteDrag.id + '"]');
+            for (const node of targets) {
+              node.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+            }
+            return;
+          }
+          if (highlightDrag) {
+            highlightDrag.current = clientToViewPoint(event.clientX, event.clientY);
+            updatePreviewRect();
+            return;
+          }
+          if (!panDragging) return;
+          const dx = event.clientX - dragStartX;
+          const dy = event.clientY - dragStartY;
+          stage.scrollLeft = clampScroll(dragStartScrollLeft - dx, Math.max(0, stage.scrollWidth - stage.clientWidth));
+          stage.scrollTop = clampScroll(dragStartScrollTop - dy, Math.max(0, stage.scrollHeight - stage.clientHeight));
+        };
+        const onWindowMouseUp = async (event) => {
+          if (noteDrag) {
+            const moved = noteDrag;
+            noteDrag = null;
+            const dx = event.clientX - moved.startClientX;
+            const dy = event.clientY - moved.startClientY;
+            const targets = annLayer.querySelectorAll('[data-ann-id="' + moved.id + '"]');
+            for (const node of targets) {
+              node.style.transform = 'none';
+            }
+            if (Math.abs(dx) >= 1 || Math.abs(dy) >= 1) {
+              const size = getDisplaySize();
+              const dxPdf = (dx / size.w) * Math.max(1, pageRect?.w || 1);
+              const dyPdf = -(dy / size.h) * Math.max(1, pageRect?.h || 1);
+              const nextRects = moved.startRects.map((rect) => ({
+                ...rect,
+                x: rect.x + dxPdf,
+                y: rect.y + dyPdf,
+              }));
+              await commitAnnotationUpdate(moved.id, { rects: nextRects });
+            }
+            setStageCursor();
+            suppressClick = true;
+            return;
+          }
+          if (highlightDrag) {
+            const dragged = highlightDrag;
+            highlightDrag = null;
+            updatePreviewRect();
+            const viewRect = normalizeViewRect(dragged.start, dragged.current);
+            if (viewRect.w >= minViewRectSize && viewRect.h >= minViewRectSize) {
+              const pdfRect = viewRectToPdfRect(viewRect);
+              if (pdfRect && canEditPageAnnotations) {
+                await api.annotationCreate({
+                  docId: meta.docId,
+                  page: meta.page,
+                  kind: 'highlight',
+                  rects: [pdfRect],
+                  color: highlightColor,
+                });
+              }
+            }
+            suppressClick = true;
+            setStageCursor();
+            return;
+          }
+          if (!panDragging) return;
+          panDragging = false;
+          setStageCursor();
+          suppressClick = true;
+        };
+        const onWindowMouseUpListener = (event) => {
+          void onWindowMouseUp(event);
+        };
+        window.addEventListener('mousemove', onWindowMouseMove);
+        window.addEventListener('mouseup', onWindowMouseUpListener);
 
         const onSelectionChange = () => {
           rememberSelection();
@@ -1091,22 +2388,41 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           capHint.textContent = 'This figure has no caption rectangle, linked highlights are unavailable.';
         }
 
+        if (!canEditPageAnnotations) {
+          setStatusHint('Preview mode: page annotations are unavailable in this popup.');
+        }
+
         const unsubscribe = typeof api?.onAnnotationChanged === 'function'
           ? api.onAnnotationChanged((event) => {
               if (!meta.docId) return;
               if (event?.docId && event.docId !== meta.docId) return;
               void loadLinkedAnnotation();
+              void loadPageAnnotations();
             })
           : null;
         window.addEventListener('beforeunload', () => {
           document.removeEventListener('selectionchange', onSelectionChange);
+          document.removeEventListener('wheel', onGlobalWheel, true);
+          resizeObserver.disconnect();
+          window.removeEventListener('mousemove', onWindowMouseMove);
+          window.removeEventListener('mouseup', onWindowMouseUpListener);
+          window.removeEventListener('gesturestart', onGlobalGesture);
+          window.removeEventListener('gesturechange', onGlobalGesture);
+          window.removeEventListener('gestureend', onGlobalGesture);
+          if (wheelThrottleRaf !== null) {
+            window.cancelAnimationFrame(wheelThrottleRaf);
+            wheelThrottleRaf = null;
+          }
           if (typeof unsubscribe === 'function') {
             unsubscribe();
           }
         });
 
+        computeBaseDisplaySize();
+        applyToolUi();
         render();
         void loadLinkedAnnotation();
+        void loadPageAnnotations();
       })();
     </script>
     </body></html>`;
@@ -1121,7 +2437,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     await popup.loadFile(popupFile);
   });
 
-  ipcMain.handle("reference.openPopup", (_event, payload: { indices: number[]; entries: ReferenceEntry[] }) => {
+  ipcMain.handle("reference.openPopup", async (_event, payload: { indices: number[]; entries: ReferenceEntry[] }) => {
     const popup = new BrowserWindow({
       width: 920,
       height: 820,
@@ -1161,7 +2477,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         }
       </body></html>`;
 
-    void popup.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    await loadPopupHtmlFile(popup, "references", html);
   });
 
   ipcMain.handle("annotation.create", async (_event, payload: Omit<AnnotationItem, "id" | "createdAt" | "updatedAt">) => {

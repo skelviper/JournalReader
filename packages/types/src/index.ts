@@ -121,10 +121,42 @@ export type FigurePopupPayload = {
   docId: string;
   targetId: string;
   page: number;
+  captionPage?: number;
+  pageRect?: Rect;
+  focusRect?: Rect;
   captionRect?: Rect;
   caption: string;
+  pageImageDataUrl?: string;
   imageDataUrl: string;
 };
+
+export type TranslateProvider = "google" | "libre" | "mymemory";
+
+export type TranslateTextPayload = {
+  text: string;
+  sourceLang: string;
+  targetLang: string;
+  provider: TranslateProvider;
+};
+
+export type TranslateTextResponse = {
+  provider: TranslateProvider;
+  sourceLang: string;
+  targetLang: string;
+  detectedSourceLang?: string;
+  translatedText: string;
+};
+
+export type TranslatePopupPayload = {
+  sourceText: string;
+  translatedText: string;
+  provider: TranslateProvider;
+  sourceLang: string;
+  targetLang: string;
+  detectedSourceLang?: string;
+};
+
+export type RecognizedPopupKind = "ref" | "fig" | "table" | "supp";
 
 export type CaptionSyncHighlightsPayload = {
   docId: string;
@@ -178,9 +210,12 @@ export type JournalApi = {
   referenceSearchByText: (docId: string, text: string, limit?: number) => Promise<ReferenceEntry[]>;
   referenceHasEntries: (docId: string) => Promise<boolean>;
   referenceOpenPopup: (payload: { indices: number[]; entries: ReferenceEntry[] }) => Promise<void>;
+  translateText: (payload: TranslateTextPayload) => Promise<TranslateTextResponse>;
+  translateOpenPopup: (payload: TranslatePopupPayload) => Promise<void>;
   figureGetTarget: (docId: string, targetId: string) => Promise<FigureTargetResponse>;
   figureListTargets: (docId: string, kind: TargetKind, label: string) => Promise<FigureTargetCandidate[]>;
   figureOpenPopup: (payload: FigurePopupPayload) => Promise<void>;
+  recognizedOpenPopup: (docId: string, kind: RecognizedPopupKind) => Promise<boolean>;
   annotationCreate: (payload: CreateAnnotationPayload) => Promise<AnnotationItem>;
   annotationUpdate: (payload: UpdateAnnotationPayload) => Promise<AnnotationItem | null>;
   annotationDelete: (id: string) => Promise<boolean>;

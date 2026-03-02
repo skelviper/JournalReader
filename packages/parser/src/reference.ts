@@ -323,8 +323,35 @@ function matchRectFromTokens(tokens: LineToken[], start: number, end: number): R
   return null;
 }
 
+function hasDenseReferenceStartsAround(lines: LineEntry[], anchorIndex: number): boolean {
+  if (anchorIndex < 0 || anchorIndex >= lines.length) {
+    return false;
+  }
+  const anchorPage = lines[anchorIndex]?.page ?? -1;
+  if (anchorPage < 0) {
+    return false;
+  }
+  const probe = lines.filter((line) => line.page >= anchorPage && line.page <= anchorPage + 2);
+  const starts = probe.flatMap((line) => parseEntryStartsInLine(line.text).map((entry) => entry.index));
+  if (starts.length < 2) {
+    return false;
+  }
+  const unique = [...new Set(starts)];
+  const maxIndex = unique.length > 0 ? Math.max(...unique) : 0;
+  return unique.length >= 2 && maxIndex >= 2;
+}
+
 function findReferencesStart(lines: LineEntry[]): number {
-  return lines.findIndex((line) => REFERENCES_HEADER_PATTERN.test(normalizeEntryLeadNoise(line.text)));
+  const explicitHeaders = lines
+    .map((line, idx) => ({ line, idx }))
+    .filter((item) => REFERENCES_HEADER_PATTERN.test(normalizeEntryLeadNoise(item.line.text)))
+    .map((item) => item.idx);
+  for (const idx of explicitHeaders) {
+    if (hasDenseReferenceStartsAround(lines, idx)) {
+      return idx;
+    }
+  }
+  return -1;
 }
 
 function parseEntryStart(text: string): { index: number; body: string } | null {
@@ -349,12 +376,34 @@ function parseEntryStart(text: string): { index: number; body: string } | null {
   if (looseNumbered) {
     const index = Number(looseNumbered[1]);
     const body = normalizeSpaces(looseNumbered[2] ?? "");
-    if (index >= 1 && index <= 999 && body.length >= 10 && /[A-Za-z]/.test(body)) {
+    if (index >= 1 && index <= 999 && isLikelyLooseReferenceBody(body)) {
       return { index, body };
     }
   }
 
   return null;
+}
+
+function isLikelyLooseReferenceBody(body: string): boolean {
+  const text = normalizeSpaces(body);
+  if (text.length < 12) {
+    return false;
+  }
+  if (!/[A-Za-z]/.test(text)) {
+    return false;
+  }
+
+  const hasYear = /(?:19|20)\d{2}[a-z]?/.test(text);
+  const hasEtAl = /\bet\s+al\.?/i.test(text);
+  const hasDoi = /\bdoi[:\s]/i.test(text) || /https?:\/\/doi\.org\//i.test(text);
+  const hasAuthorLead = /^[A-Z][A-Za-z'’\-]{1,40}(?:,\s*[A-Z][A-Za-z.\-\s]{0,20})?/.test(text);
+  const hasJournalCue = /\b(?:Nature|Science|Cell|Genome|Nucleic|Proceedings|PNAS|Methods|Bioinformatics)\b/i.test(text);
+  const hasVolumePages = /\b\d{1,4}\s*[:(]\s*\d{1,5}(?:\s*[-–]\s*\d{1,5})?/.test(text);
+
+  return (
+    (hasAuthorLead && (hasYear || hasEtAl || hasDoi || hasJournalCue || hasVolumePages)) ||
+    (hasYear && (hasEtAl || hasDoi || hasJournalCue || hasVolumePages))
+  );
 }
 
 function isNearLineStart(text: string, start: number): boolean {
@@ -407,6 +456,46 @@ function parseEntryStartsInLine(text: string): Array<{ index: number; body: stri
     if (sliced) {
       return [sliced];
     }
+  }
+
+  // Some two-column layouts get flattened into one line such as
+  // "... 61. Jung, I. ...". Detect embedded reference-like starts.
+  const embeddedPattern = /(?:^|\s)(\d{1,4})\.\s+([A-Z][A-Za-z'’\-]{1,40}(?:,|\s+(?:and|&)\s+[A-Z]))/g;
+  for (const match of normalized.matchAll(embeddedPattern)) {
+    const indexStart = match.index ?? -1;
+    if (indexStart < 0) {
+      continue;
+    }
+    const rawNumber = match[1];
+    if (!rawNumber) {
+      continue;
+    }
+    const leadingOffset = match[0].indexOf(rawNumber);
+    if (leadingOffset < 0) {
+      continue;
+    }
+    const start = indexStart + leadingOffset;
+    const segment = normalized.slice(start).trim();
+    const parsed = parseEntryStart(segment);
+    if (!parsed) {
+      continue;
+    }
+    if (parsed.index < 1 || parsed.index > 999) {
+      continue;
+    }
+    if (parsed.body.length < 12) {
+      continue;
+    }
+    out.push(parsed);
+  }
+  if (out.length > 0) {
+    const uniq = new Map<number, { index: number; body: string }>();
+    for (const item of out) {
+      if (!uniq.has(item.index)) {
+        uniq.set(item.index, item);
+      }
+    }
+    return [...uniq.values()];
   }
 
   return [];
@@ -487,7 +576,156 @@ function isLikelyEntryContinuation(text: string): boolean {
   if (/^(acknowledg|author contributions|data availability|code availability)\b/i.test(normalized)) {
     return false;
   }
+  if (/^(reporting summary|editorial polic(y|ies)|statistics for|nature portfolio|checklist)\b/i.test(normalized)) {
+    return false;
+  }
   return true;
+}
+
+type ReferenceColumnBand = {
+  xMin: number;
+  xMax: number;
+  center: number;
+  count: number;
+};
+
+function isPlausibleReferenceSeed(body: string): boolean {
+  const text = normalizeSpaces(body);
+  if (text.length < 8 || !/[A-Za-z]/.test(text)) {
+    return false;
+  }
+  if (/^(times|and|for|the|of|to|in|with|this|that|were|was|is|are)\b/i.test(text)) {
+    return false;
+  }
+  if (/^(reporting summary|editorial polic(y|ies)|statistics for|nature portfolio|checklist)\b/i.test(text)) {
+    return false;
+  }
+
+  const hasYear = /(?:19|20)\d{2}[a-z]?/.test(text);
+  const hasEtAl = /\bet\s+al\.?/i.test(text);
+  const hasDoi = /\bdoi[:\s]/i.test(text) || /https?:\/\/doi\.org\//i.test(text);
+  const startsWithParticle = /^(?:de|van|von|da|di|del|la|le|du)\s+[A-Z][A-Za-z'’\-]{1,40}\b/.test(text);
+  const hasAuthorLead =
+    /^[A-Z][A-Za-z'’\-]{1,40}(?:,\s*[A-Z][A-Za-z.\-\s]{0,20})?/.test(text) ||
+    /^[A-Z][A-Za-z'’\-]{1,40}\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40}/.test(text) ||
+    startsWithParticle;
+  const hasJournalCue = /\b(?:Nature|Science|Cell|Genome|Nucleic|Proceedings|PNAS|Methods|Bioinformatics)\b/i.test(text);
+  const hasVolumePages = /\b\d{1,4}\s*[:(]\s*\d{1,5}(?:\s*[-–]\s*\d{1,5})?/.test(text);
+
+  let score = 0;
+  if (hasAuthorLead) score += 2;
+  if (hasYear) score += 2;
+  if (hasEtAl) score += 2;
+  if (hasDoi) score += 2;
+  if (hasJournalCue) score += 1;
+  if (hasVolumePages) score += 1;
+
+  if (/^[a-z]/.test(text) && !startsWithParticle && score < 2) {
+    return false;
+  }
+  return score >= 2;
+}
+
+function clusterReferenceBands(lines: LineEntry[]): ReferenceColumnBand[] {
+  if (lines.length === 0) {
+    return [];
+  }
+  const sorted = [...lines].sort((a, b) => (a.bbox.x + a.bbox.w / 2) - (b.bbox.x + b.bbox.w / 2));
+  const clusters: Array<{ members: LineEntry[]; center: number }> = [];
+  const threshold = 180;
+  for (const line of sorted) {
+    const center = line.bbox.x + line.bbox.w / 2;
+    const nearest = clusters
+      .map((cluster, idx) => ({ idx, delta: Math.abs(cluster.center - center) }))
+      .sort((a, b) => a.delta - b.delta)[0];
+    if (!nearest || nearest.delta > threshold) {
+      clusters.push({ members: [line], center });
+      continue;
+    }
+    const target = clusters[nearest.idx];
+    if (!target) {
+      continue;
+    }
+    target.members.push(line);
+    target.center = target.members.reduce((sum, member) => sum + member.bbox.x + member.bbox.w / 2, 0) / target.members.length;
+  }
+
+  const bands = clusters
+    .map((cluster) => {
+      const xMin = Math.min(...cluster.members.map((line) => line.bbox.x)) - 38;
+      const xMax = Math.max(...cluster.members.map((line) => line.bbox.x + line.bbox.w)) + 38;
+      return {
+        xMin,
+        xMax,
+        center: cluster.center,
+        count: cluster.members.length,
+      };
+    })
+    .sort((a, b) => {
+      if (a.count !== b.count) {
+        return b.count - a.count;
+      }
+      return a.center - b.center;
+    });
+
+  if (bands.length <= 1) {
+    return bands;
+  }
+
+  const first = bands[0];
+  const second = bands[1];
+  if (!first || !second) {
+    return bands.slice(0, 1);
+  }
+  if (second.count < Math.max(2, Math.floor(first.count * 0.22))) {
+    return [first];
+  }
+  return [first, second].sort((a, b) => a.center - b.center);
+}
+
+function buildReferenceBandsByPage(lines: LineEntry[]): Map<number, ReferenceColumnBand[]> {
+  const byPage = new Map<number, LineEntry[]>();
+  for (const line of lines) {
+    const list = byPage.get(line.page) ?? [];
+    list.push(line);
+    byPage.set(line.page, list);
+  }
+  const out = new Map<number, ReferenceColumnBand[]>();
+  for (const [page, pageLines] of byPage.entries()) {
+    const bands = clusterReferenceBands(pageLines);
+    if (bands.length > 0) {
+      out.set(page, bands);
+    }
+  }
+  return out;
+}
+
+function lineCenterX(line: LineEntry): number {
+  return line.bbox.x + line.bbox.w / 2;
+}
+
+function lineInBands(line: LineEntry, bands: ReferenceColumnBand[]): boolean {
+  if (bands.length === 0) {
+    return true;
+  }
+  const cx = lineCenterX(line);
+  return bands.some((band) => cx >= band.xMin && cx <= band.xMax);
+}
+
+function resolveBandsForPage(page: number, bandsByPage: Map<number, ReferenceColumnBand[]>): ReferenceColumnBand[] {
+  const direct = bandsByPage.get(page);
+  if (direct && direct.length > 0) {
+    return direct;
+  }
+  const prev = bandsByPage.get(page - 1);
+  if (prev && prev.length > 0) {
+    return prev;
+  }
+  const next = bandsByPage.get(page + 1);
+  if (next && next.length > 0) {
+    return next;
+  }
+  return [];
 }
 
 function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: number): ReferenceEntry[] {
@@ -497,24 +735,71 @@ function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: 
   }
 
   const scoped = lines.slice(startIndex + 1);
+  const startCandidates = scoped
+    .map((line) => ({ line, starts: parseEntryStartsInLine(line.text) }))
+    .filter((item) => item.starts.length > 0);
+  const plausibleStartLines = startCandidates
+    .filter((item) => item.starts.some((entry) => isPlausibleReferenceSeed(entry.body)))
+    .map((item) => item.line);
+  const allowWeakStarts = plausibleStartLines.length < 2;
+  const seedLines = plausibleStartLines.length >= 2 ? plausibleStartLines : startCandidates.map((item) => item.line);
+  const seedPages = [...new Set(seedLines.map((line) => line.page))].sort((a, b) => a - b);
+  const firstSeedPage = seedPages[0] ?? -1;
+  const lastSeedPage = seedPages[seedPages.length - 1] ?? -1;
+  const bandsByPage = buildReferenceBandsByPage(seedLines);
+  let lastAcceptedIndex = 0;
+
   for (let i = 0; i < scoped.length; i += 1) {
     const line = scoped[i];
     if (!line) {
       continue;
     }
 
+    if (firstSeedPage > 0 && line.page < firstSeedPage) {
+      continue;
+    }
+    if (lastSeedPage > 0 && line.page > lastSeedPage + 2) {
+      break;
+    }
+
     const starts = parseEntryStartsInLine(line.text);
     if (starts.length === 0) {
       continue;
     }
+    const lineBands = resolveBandsForPage(line.page, bandsByPage);
+    if (lineBands.length > 0 && !lineInBands(line, lineBands)) {
+      continue;
+    }
 
-    for (const start of starts) {
+    const acceptedStarts = starts.filter((start) => {
+      if (isPlausibleReferenceSeed(start.body)) {
+        return true;
+      }
+      // Tolerate short stretches of weakly formatted entries when numbering is contiguous.
+      if (allowWeakStarts && starts.length === 1) {
+        if (lastAcceptedIndex === 0 && start.index <= 3) {
+          return true;
+        }
+        if (lastAcceptedIndex > 0 && Math.abs(start.index - lastAcceptedIndex) <= 2) {
+          return true;
+        }
+      }
+      return false;
+    });
+    if (acceptedStarts.length === 0) {
+      continue;
+    }
+
+    for (const start of acceptedStarts) {
       if (start.index < 1 || start.index > 500) {
+        continue;
+      }
+      if (entries.length >= 8 && lastAcceptedIndex > 0 && start.index > lastAcceptedIndex + 80) {
         continue;
       }
 
       let text = start.body;
-      if (starts.length === 1) {
+      if (acceptedStarts.length === 1) {
         const anchorX = line.bbox.x;
         for (let j = i + 1; j < scoped.length; j += 1) {
           const next = scoped[j];
@@ -524,10 +809,20 @@ function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: 
           if (parseEntryStartsInLine(next.text).length > 0) {
             break;
           }
-          if (next.page === line.page && Math.abs(next.bbox.x - anchorX) > 360) {
+          if (next.page > line.page + 1) {
+            break;
+          }
+          if (lastSeedPage > 0 && next.page > lastSeedPage + 1) {
+            break;
+          }
+          const nextBands = resolveBandsForPage(next.page, bandsByPage);
+          if (nextBands.length > 0 && !lineInBands(next, nextBands)) {
+            if (next.page === line.page) {
+              break;
+            }
             continue;
           }
-          if (next.page > line.page + 1) {
+          if (next.page === line.page && Math.abs(next.bbox.x - anchorX) > 260) {
             break;
           }
           if (!isLikelyEntryContinuation(next.text)) {
@@ -547,6 +842,7 @@ function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: 
         text: finalText,
         page: line.page,
       });
+      lastAcceptedIndex = Math.max(lastAcceptedIndex, start.index);
     }
   }
 

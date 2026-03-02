@@ -93,6 +93,23 @@ describe("extractCaptions", () => {
     expect(cap?.caption).toContain("c, Another continuation line.");
   });
 
+  it("merges 'see next page for caption' with same-label caption on following page", () => {
+    const spans = [
+      { text: "Extended Data Fig. 1: See next page for caption.", page: 20, bbox: { x: 28, y: 34, w: 360, h: 14 } },
+      { text: "Extended Data Fig. 1: Full caption starts here.", page: 21, bbox: { x: 26, y: 760, w: 360, h: 14 } },
+      { text: "a, panel description.", page: 21, bbox: { x: 26, y: 742, w: 240, h: 14 } },
+      { text: "b, another panel description.", page: 21, bbox: { x: 26, y: 724, w: 280, h: 14 } },
+    ];
+
+    const out = extractCaptions(spans);
+    const merged = out.filter((item) => item.kind === "supplementary" && item.label === "1");
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.page).toBe(20);
+    expect(merged[0]?.caption).toContain("Full caption starts here.");
+    expect(merged[0]?.caption).toContain("a, panel description.");
+    expect(merged[0]?.caption).toContain("b, another panel description.");
+  });
+
   it("does not cross pages for long same-page captions", () => {
     const spans = [
       { text: "Fig. 3: Long caption title with sufficient body on current page.", page: 12, bbox: { x: 22, y: 80, w: 420, h: 14 } },

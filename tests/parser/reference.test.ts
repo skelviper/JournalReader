@@ -155,4 +155,21 @@ describe("extractReferenceData", () => {
     const out = extractReferenceData(spans, "doc-ref6");
     expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([1, 2]));
   });
+
+  it("filters numbered body-text noise inside references section and keeps plausible entries", () => {
+    const spans = [
+      { text: "References", page: 12, bbox: { x: 22, y: 760, w: 120, h: 14 } },
+      {
+        text: "1. 5 times the IQR, and diamond-shaped markers beyond this range indicate motifs are virtually inactive.",
+        page: 12,
+        bbox: { x: 22, y: 742, w: 560, h: 14 },
+      },
+      { text: "2. Smith, J. et al. Regulatory grammar in human promoters (2024).", page: 12, bbox: { x: 22, y: 724, w: 540, h: 14 } },
+      { text: "3. Doe, A. et al. Deep-learning maps for enhancer activity (2025).", page: 12, bbox: { x: 22, y: 706, w: 540, h: 14 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref7");
+    expect(out.entries.some((entry) => entry.index === 1)).toBe(false);
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([2, 3]));
+  });
 });

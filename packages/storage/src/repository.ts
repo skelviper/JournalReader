@@ -631,6 +631,23 @@ export class StorageRepository {
     return row.n > 0;
   }
 
+  listAllReferenceEntries(docId: string): ReferenceEntry[] {
+    const rows = this.db
+      .prepare(
+        `SELECT doc_id, ref_index, text, page
+         FROM reference_entries
+         WHERE doc_id = ?
+         ORDER BY ref_index ASC`,
+      )
+      .all(docId) as ReferenceEntryRow[];
+    return rows.map((row) => ({
+      docId: row.doc_id,
+      index: row.ref_index,
+      text: row.text,
+      page: row.page,
+    }));
+  }
+
   getTarget(docId: string, targetId: string): VisualTarget | null {
     const row = this.db
       .prepare("SELECT * FROM visual_targets WHERE doc_id = ? AND id = ?")
@@ -700,6 +717,30 @@ export class StorageRepository {
         }
         return b.confidence - a.confidence;
       });
+  }
+
+  listTargetsByKind(docId: string, kind: TargetKind): VisualTarget[] {
+    const rows = this.db
+      .prepare(
+        `SELECT *
+         FROM visual_targets
+         WHERE doc_id = ?
+           AND kind = ?
+         ORDER BY page ASC, label ASC, confidence DESC`,
+      )
+      .all(docId, kind) as VisualTargetRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      docId: row.doc_id,
+      kind: row.kind,
+      label: row.label,
+      page: row.page,
+      cropRect: JSON.parse(row.crop_rect_json) as Rect,
+      captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
+      caption: row.caption,
+      confidence: row.confidence,
+      source: row.source,
+    }));
   }
 
   createAnnotation(

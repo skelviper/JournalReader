@@ -239,10 +239,6 @@ select {
   cursor: text;
 }
 
-.text-span.citation {
-  cursor: pointer;
-}
-
 .annotation-layer {
   position: absolute;
   inset: 0;
@@ -419,6 +415,34 @@ select {
   font-size: 12px;
 }
 
+.recognized-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.recognized-label {
+  font-weight: 700;
+  color: #526479;
+}
+
+.recognized-chip {
+  border: 1px solid #c6cfdb;
+  background: #ffffff;
+  color: #26384d;
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.recognized-chip:hover {
+  background: #edf3fb;
+  border-color: #9db3d2;
+}
+
 .drag-preview {
   position: absolute;
   border: 2px dashed #2a5fa8;
@@ -499,6 +523,93 @@ select {
   align-items: center;
   gap: 8px;
   padding: 3px 6px 6px;
+}
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1800;
+  background: rgba(14, 18, 27, 0.26);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+}
+
+.settings-panel {
+  width: min(560px, 100%);
+  max-height: min(82vh, 740px);
+  overflow: auto;
+  border-radius: 12px;
+  border: 1px solid #cad5e4;
+  background: #f9fbff;
+  box-shadow: 0 18px 42px rgba(22, 37, 58, 0.28);
+  padding: 12px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.settings-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #223449;
+}
+
+.settings-close {
+  border: 1px solid #c8d2e0;
+  background: #fff;
+  border-radius: 8px;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  color: #5e6f82;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.settings-section {
+  border: 1px solid #d4dde9;
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.settings-subtitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: #32455e;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-field > span {
+  font-size: 12px;
+  color: #627286;
+}
+
+.settings-field select {
+  border: 1px solid #c6cfdb;
+  border-radius: 8px;
+  background: #fff;
+  color: #1f2f43;
+  padding: 6px 8px;
+}
+
+.settings-hint {
+  font-size: 12px;
+  color: #5b6d84;
 }
 
 @media (max-width: 1100px) {

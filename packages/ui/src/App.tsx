@@ -2,7 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, RefObject } from "react";
 import type { MouseEvent as ReactMouseEvent, WheelEvent as ReactWheelEvent } from "react";
 import { getDocument, GlobalWorkerOptions, Util } from "pdfjs-dist";
-import type { AnnotationItem, FigureTargetCandidate, NoteTextStyle, Rect, TargetKind } from "@journal-reader/types";
+import type {
+  AnnotationItem,
+  FigureTargetCandidate,
+  NoteTextStyle,
+  Rect,
+  RecognizedPopupKind,
+  TargetKind,
+  TranslateProvider,
+} from "@journal-reader/types";
 import type { JournalApi } from "./api.js";
 import "./styles.css";
 
@@ -44,6 +52,12 @@ type HighlightMenuState = {
   x: number;
   y: number;
   annotationId: string;
+};
+
+type TranslationSettings = {
+  provider: TranslateProvider;
+  sourceLang: string;
+  targetLang: string;
 };
 
 type DragState = {
@@ -90,6 +104,15 @@ type PixelBox = {
   score: number;
 };
 
+type PageVisualMask = {
+  page: PDFPageProxy;
+  pageRect: Rect;
+  viewport: ReturnType<PDFPageProxy["getViewport"]>;
+  mask: Uint8Array;
+  width: number;
+  height: number;
+};
+
 const MIN_SCALE = 0.8;
 const MAX_SCALE = 2.8;
 const PINCH_BASE_GAIN = 0.00155;
@@ -110,6 +133,26 @@ const NOTE_FONTS = [
 ] as const;
 const NOTE_FONT_SIZES = [16, 20, 24, 28, 32, 40] as const;
 const MENU_VIEWPORT_MARGIN = 8;
+const TRANSLATION_SETTINGS_KEY = "journal-reader.translation-settings.v2";
+const TRANSLATION_PROVIDERS: Array<{ value: TranslateProvider; label: string }> = [
+  { value: "google", label: "Google Translate" },
+  { value: "libre", label: "LibreTranslate" },
+  { value: "mymemory", label: "MyMemory" },
+];
+const TRANSLATION_LANGUAGES: Array<{ value: string; label: string }> = [
+  { value: "auto", label: "Auto Detect" },
+  { value: "en", label: "English" },
+  { value: "zh-CN", label: "Chinese (Simplified)" },
+  { value: "ja", label: "Japanese" },
+  { value: "ko", label: "Korean" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "es", label: "Spanish" },
+  { value: "it", label: "Italian" },
+  { value: "ru", label: "Russian" },
+  { value: "pt", label: "Portuguese" },
+  { value: "ar", label: "Arabic" },
+];
 
 function clampMenuAnchor(x: number, y: number, menuWidth: number, menuHeight: number): { x: number; y: number } {
   const maxX = Math.max(MENU_VIEWPORT_MARGIN, window.innerWidth - menuWidth - MENU_VIEWPORT_MARGIN);
@@ -118,6 +161,45 @@ function clampMenuAnchor(x: number, y: number, menuWidth: number, menuHeight: nu
     x: Math.min(Math.max(x, MENU_VIEWPORT_MARGIN), maxX),
     y: Math.min(Math.max(y, MENU_VIEWPORT_MARGIN), maxY),
   };
+}
+
+function defaultTranslationSettings(): TranslationSettings {
+  return {
+    provider: "google",
+    sourceLang: "en",
+    targetLang: "zh-CN",
+  };
+}
+
+function loadTranslationSettings(): TranslationSettings {
+  if (typeof window === "undefined") {
+    return defaultTranslationSettings();
+  }
+  try {
+    const raw = window.localStorage.getItem(TRANSLATION_SETTINGS_KEY);
+    if (!raw) {
+      return defaultTranslationSettings();
+    }
+    const parsed = JSON.parse(raw) as Partial<TranslationSettings>;
+    const provider = TRANSLATION_PROVIDERS.some((item) => item.value === parsed.provider)
+      ? (parsed.provider as TranslateProvider)
+      : "google";
+    const sourceLang =
+      TRANSLATION_LANGUAGES.some((item) => item.value === parsed.sourceLang) && parsed.sourceLang
+        ? parsed.sourceLang
+        : "auto";
+    const targetLang =
+      TRANSLATION_LANGUAGES.some((item) => item.value === parsed.targetLang) && parsed.targetLang
+        ? parsed.targetLang
+        : "en";
+    return {
+      provider,
+      sourceLang,
+      targetLang,
+    };
+  } catch {
+    return defaultTranslationSettings();
+  }
 }
 
 function uriListToPath(uriList: string): string | null {
@@ -259,12 +341,6 @@ function normalizeRect(a: number[], b: number[]): Rect {
   const w = Math.max(1, Math.abs(ax - bx));
   const h = Math.max(1, Math.abs(ay - by));
   return { x, y, w, h };
-}
-
-function isCitationToken(text: string): boolean {
-  return /\b(Fig(?:s|ures)?\.?\s*S?\d+[A-Za-z]?|Table(?:s)?\s*S?\d+[A-Za-z]?|Supplementary\s+(?:Fig(?:ure)?\.?|Table)\s*S?\d+[A-Za-z]?|Extended\s+Data\s+(?:Fig(?:ure)?\.?|Table)\s*\d+[A-Za-z]?)\b/i.test(
-    text,
-  );
 }
 
 function parseIndexList(text: string): number[] | null {
@@ -468,6 +544,58 @@ function clearMaskRect(mask: Uint8Array, width: number, height: number, rect: Pi
   }
 }
 
+async function buildPageVisualMask(pdfDoc: PDFDocumentProxy, pageNumber: number, scale = 2): Promise<PageVisualMask | null> {
+  const page = await pdfDoc.getPage(pageNumber);
+  const pageRect = toPdfPageRect(page);
+  const viewport = page.getViewport({ scale });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return null;
+  }
+
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const mask = new Uint8Array(canvas.width * canvas.height);
+  for (let i = 0, p = 0; i < image.data.length; i += 4, p += 1) {
+    const r = image.data[i] ?? 255;
+    const g = image.data[i + 1] ?? 255;
+    const b = image.data[i + 2] ?? 255;
+    const a = image.data[i + 3] ?? 255;
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    mask[p] = a > 16 && luminance < 245 ? 1 : 0;
+  }
+
+  // Clear text-layer glyph boxes so layout detection focuses on non-text visual blocks.
+  const textContent = await page.getTextContent();
+  for (const item of textContent.items) {
+    if (!("str" in item && "transform" in item)) {
+      continue;
+    }
+    const tx = Util.transform(viewport.transform, item.transform);
+    const width = ("width" in item ? item.width : 8) * scale;
+    const height = ("height" in item ? item.height : 12) * scale;
+    clearMaskRect(mask, canvas.width, canvas.height, {
+      x0: tx[4] - 2,
+      y0: tx[5] - height - 2,
+      x1: tx[4] + width + 2,
+      y1: tx[5] + 2,
+    });
+  }
+
+  return {
+    page,
+    pageRect,
+    viewport,
+    mask,
+    width: canvas.width,
+    height: canvas.height,
+  };
+}
+
 function findBestComponent(
   mask: Uint8Array,
   width: number,
@@ -601,6 +729,150 @@ function findBestComponent(
   return { minX, minY, maxX, maxY, area, score: best.score };
 }
 
+function findDominantComponent(mask: Uint8Array, width: number, height: number): PixelBox | null {
+  if (width < 8 || height < 8) {
+    return null;
+  }
+
+  const visited = new Uint8Array(width * height);
+  const queueX = new Int32Array(width * height);
+  const queueY = new Int32Array(width * height);
+  const pageArea = Math.max(1, width * height);
+  const minArea = Math.max(180, Math.floor(pageArea * 0.0014));
+  const marginX = Math.max(2, Math.floor(width * 0.01));
+  const marginY = Math.max(2, Math.floor(height * 0.01));
+  const x0 = marginX;
+  const y0 = marginY;
+  const x1 = width - marginX - 1;
+  const y1 = height - marginY - 1;
+  const components: PixelBox[] = [];
+
+  for (let y = y0; y <= y1; y += 1) {
+    for (let x = x0; x <= x1; x += 1) {
+      const idx = y * width + x;
+      if (!mask[idx] || visited[idx]) {
+        continue;
+      }
+
+      let head = 0;
+      let tail = 0;
+      queueX[tail] = x;
+      queueY[tail] = y;
+      tail += 1;
+      visited[idx] = 1;
+
+      let area = 0;
+      let minX = x;
+      let minY = y;
+      let maxX = x;
+      let maxY = y;
+
+      while (head < tail) {
+        const cx = queueX[head];
+        const cy = queueY[head];
+        head += 1;
+        area += 1;
+        minX = Math.min(minX, cx);
+        minY = Math.min(minY, cy);
+        maxX = Math.max(maxX, cx);
+        maxY = Math.max(maxY, cy);
+
+        const neighbors = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1],
+        ];
+        for (const [nx, ny] of neighbors) {
+          if (nx < x0 || nx > x1 || ny < y0 || ny > y1) {
+            continue;
+          }
+          const nIdx = ny * width + nx;
+          if (visited[nIdx] || !mask[nIdx]) {
+            continue;
+          }
+          visited[nIdx] = 1;
+          queueX[tail] = nx;
+          queueY[tail] = ny;
+          tail += 1;
+        }
+      }
+
+      if (area < minArea) {
+        continue;
+      }
+
+      const compW = maxX - minX + 1;
+      const compH = maxY - minY + 1;
+      const areaRatio = area / pageArea;
+      if (compW < 12 || compH < 12 || areaRatio > 0.94) {
+        continue;
+      }
+
+      const aspect = Math.max(compW / Math.max(1, compH), compH / Math.max(1, compW));
+      if (aspect > 12 && areaRatio < 0.2) {
+        continue;
+      }
+
+      const fillRatio = area / Math.max(1, compW * compH);
+      const centerX = (minX + maxX) / 2;
+      const centerY = (minY + maxY) / 2;
+      const normCenterDistance =
+        Math.hypot(centerX - width / 2, centerY - height / 2) / Math.max(1, Math.hypot(width / 2, height / 2));
+      const edgeMargin = Math.min(minX - x0, minY - y0, x1 - maxX, y1 - maxY);
+      const edgePenalty = edgeMargin < 8 ? 420 : edgeMargin < 14 ? 190 : 0;
+      const score = area * (0.95 + fillRatio * 0.35) - normCenterDistance * area * 0.28 - edgePenalty;
+      components.push({ minX, minY, maxX, maxY, area, score });
+    }
+  }
+
+  if (components.length === 0) {
+    return null;
+  }
+
+  const sorted = [...components].sort((a, b) => b.score - a.score);
+  const best = sorted[0];
+  if (!best) {
+    return null;
+  }
+
+  const bestW = best.maxX - best.minX + 1;
+  const bestH = best.maxY - best.minY + 1;
+  const joinPadX = Math.max(44, Math.floor(bestW * 0.9));
+  const joinPadY = Math.max(36, Math.floor(bestH * 0.9));
+  const areaGate = Math.max(minArea, best.area * 0.05);
+  const selected = sorted
+    .filter((item) => {
+      if (item.area < areaGate) {
+        return false;
+      }
+      const cx = (item.minX + item.maxX) / 2;
+      const cy = (item.minY + item.maxY) / 2;
+      return (
+        cx >= best.minX - joinPadX &&
+        cx <= best.maxX + joinPadX &&
+        cy >= best.minY - joinPadY &&
+        cy <= best.maxY + joinPadY
+      );
+    })
+    .slice(0, 140);
+
+  const unionSet = selected.length > 0 ? selected : [best];
+  let minX = unionSet[0]?.minX ?? best.minX;
+  let minY = unionSet[0]?.minY ?? best.minY;
+  let maxX = unionSet[0]?.maxX ?? best.maxX;
+  let maxY = unionSet[0]?.maxY ?? best.maxY;
+  let area = 0;
+  for (const item of unionSet) {
+    minX = Math.min(minX, item.minX);
+    minY = Math.min(minY, item.minY);
+    maxX = Math.max(maxX, item.maxX);
+    maxY = Math.max(maxY, item.maxY);
+    area += item.area;
+  }
+  return { minX, minY, maxX, maxY, area, score: best.score };
+}
+
 function toPdfPageRect(page: PDFPageProxy): Rect {
   const [x1 = 0, y1 = 0, x2 = 0, y2 = 0] = page.view ?? [0, 0, 0, 0];
   return {
@@ -671,76 +943,45 @@ async function detectVisualRegionNearCaption(
   kind: string,
   options?: { allowFallback?: boolean },
 ): Promise<{ rect: Rect; mode: "component" | "fallback"; area: number; score: number } | null> {
-  const page = await pdfDoc.getPage(pageNumber);
-  const pageRect = toPdfPageRect(page);
-  const allowFallback = options?.allowFallback ?? true;
-
-  const scale = 2;
-  const viewport = page.getViewport({ scale });
-  const canvas = document.createElement("canvas");
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
+  const visual = await buildPageVisualMask(pdfDoc, pageNumber, 2);
+  if (!visual) {
     return null;
   }
+  const { page, pageRect, viewport } = visual;
+  const width = visual.width;
+  const height = visual.height;
+  const mask = visual.mask.slice();
+  const allowFallback = options?.allowFallback ?? true;
 
-  canvas.width = Math.max(1, Math.floor(viewport.width));
-  canvas.height = Math.max(1, Math.floor(viewport.height));
-  await page.render({ canvasContext: ctx, viewport }).promise;
-
-  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const mask = new Uint8Array(canvas.width * canvas.height);
-  for (let i = 0, p = 0; i < image.data.length; i += 4, p += 1) {
-    const r = image.data[i] ?? 255;
-    const g = image.data[i + 1] ?? 255;
-    const b = image.data[i + 2] ?? 255;
-    const a = image.data[i + 3] ?? 255;
-    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    mask[p] = a > 16 && luminance < 245 ? 1 : 0;
-  }
-
-  const textContent = await page.getTextContent();
-  for (const item of textContent.items) {
-    if (!("str" in item && "transform" in item)) {
-      continue;
-    }
-    const tx = Util.transform(viewport.transform, item.transform);
-    const width = ("width" in item ? item.width : 8) * scale;
-    const height = ("height" in item ? item.height : 12) * scale;
-    clearMaskRect(mask, canvas.width, canvas.height, {
-      x0: tx[4] - 2,
-      y0: tx[5] - height - 2,
-      x1: tx[4] + width + 2,
-      y1: tx[5] + 2,
-    });
-  }
-
-  const captionView = toViewportRect(page, captionRect, scale);
-  clearMaskRect(mask, canvas.width, canvas.height, {
+  const captionView = toViewportRect(page, captionRect, 2);
+  clearMaskRect(mask, width, height, {
     x0: captionView.x - 4,
     y0: captionView.y - 4,
     x1: captionView.x + captionView.w + 4,
     y1: captionView.y + captionView.h + 4,
   });
 
-  const marginX = Math.max(60, captionView.w * 0.5);
+  const minProbeWidth = width * (kind === "table" ? 0.66 : 0.86);
+  const dynamicProbeWidth = Math.max(captionView.w + Math.max(120, width * 0.06), minProbeWidth);
+  const centerX = captionView.x + captionView.w / 2;
   const column: PixelRegion = {
-    x0: captionView.x - marginX,
-    x1: captionView.x + captionView.w + marginX,
+    x0: centerX - dynamicProbeWidth / 2,
+    x1: centerX + dynamicProbeWidth / 2,
     y0: 0,
-    y1: canvas.height - 1,
+    y1: height - 1,
   };
 
   const belowRegion: PixelRegion = {
     x0: column.x0,
     x1: column.x1,
-    y0: Math.min(canvas.height - 1, captionView.y + captionView.h + 10),
-    y1: Math.min(canvas.height - 1, captionView.y + canvas.height * 0.45),
+    y0: Math.min(height - 1, captionView.y + captionView.h + 10),
+    y1: Math.min(height - 1, captionView.y + height * 0.45),
   };
 
   const aboveRegion: PixelRegion = {
     x0: column.x0,
     x1: column.x1,
-    y0: Math.max(0, captionView.y - canvas.height * 0.72),
+    y0: Math.max(0, captionView.y - height * 0.72),
     y1: Math.max(0, captionView.y - 10),
   };
 
@@ -750,9 +991,9 @@ async function detectVisualRegionNearCaption(
   const fallbackRegion = preferBelow ? aboveRegion : belowRegion;
   const fallbackSide: "above" | "below" = preferBelow ? "above" : "below";
 
-  let best = findBestComponent(mask, canvas.width, canvas.height, preferredRegion, captionView, preferredSide);
+  let best = findBestComponent(mask, width, height, preferredRegion, captionView, preferredSide);
   if (!best) {
-    best = findBestComponent(mask, canvas.width, canvas.height, fallbackRegion, captionView, fallbackSide);
+    best = findBestComponent(mask, width, height, fallbackRegion, captionView, fallbackSide);
   }
   if (!best && !allowFallback) {
     return null;
@@ -765,8 +1006,8 @@ async function detectVisualRegionNearCaption(
   const padding = 12;
   const x0 = Math.max(0, best.minX - padding);
   const y0 = Math.max(0, best.minY - padding);
-  const x1 = Math.min(canvas.width - 1, best.maxX + padding);
-  const y1 = Math.min(canvas.height - 1, best.maxY + padding);
+  const x1 = Math.min(width - 1, best.maxX + padding);
+  const y1 = Math.min(height - 1, best.maxY + padding);
 
   const a = viewport.convertToPdfPoint(x0, y0);
   const b = viewport.convertToPdfPoint(x1, y1);
@@ -782,6 +1023,63 @@ async function detectVisualRegionNearCaption(
     return { rect: fallbackRect, mode: "fallback", area: fallbackRect.w * fallbackRect.h, score: best.score };
   }
   return { rect, mode: "component", area: rect.w * rect.h, score: best.score };
+}
+
+async function detectVisualRegionByPageLayout(
+  pdfDoc: PDFDocumentProxy,
+  pageNumber: number,
+  kind: TargetKind,
+): Promise<{ rect: Rect; mode: "component"; area: number; score: number } | null> {
+  const visual = await buildPageVisualMask(pdfDoc, pageNumber, 2);
+  if (!visual) {
+    return null;
+  }
+  const best = findDominantComponent(visual.mask, visual.width, visual.height);
+  if (!best) {
+    return null;
+  }
+
+  const padding = 14;
+  const x0 = Math.max(0, best.minX - padding);
+  const y0 = Math.max(0, best.minY - padding);
+  const x1 = Math.min(visual.width - 1, best.maxX + padding);
+  const y1 = Math.min(visual.height - 1, best.maxY + padding);
+  const a = visual.viewport.convertToPdfPoint(x0, y0);
+  const b = visual.viewport.convertToPdfPoint(x1, y1);
+  const baseRect = normalizeRect(a, b);
+  const flankPad =
+    kind === "table"
+      ? Math.max(26, Math.min(80, Math.max(baseRect.w, baseRect.h) * 0.08))
+      : Math.max(30, Math.min(108, Math.max(baseRect.w, baseRect.h) * 0.11));
+  const rect = expandRectWithinPage(baseRect, visual.pageRect, flankPad);
+  const pageArea = Math.max(1, visual.pageRect.w * visual.pageRect.h);
+  const areaRatio = (rect.w * rect.h) / pageArea;
+  const minRatio = kind === "table" ? 0.018 : 0.04;
+  if (areaRatio < minRatio) {
+    return null;
+  }
+  return { rect, mode: "component", area: rect.w * rect.h, score: best.score };
+}
+
+async function renderPageImage(
+  pdfDoc: PDFDocumentProxy,
+  pageNumber: number,
+): Promise<{ imageDataUrl: string; pageRect: Rect } | null> {
+  const page = await pdfDoc.getPage(pageNumber);
+  const pageRect = toPdfPageRect(page);
+  const viewport = page.getViewport({ scale: 2.2 });
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    return null;
+  }
+  canvas.width = Math.max(1, Math.floor(viewport.width));
+  canvas.height = Math.max(1, Math.floor(viewport.height));
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return {
+    imageDataUrl: canvas.toDataURL("image/png"),
+    pageRect,
+  };
 }
 
 async function renderTargetCropImage(
@@ -900,6 +1198,8 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   const [selectionAction, setSelectionAction] = useState<SelectionAction | null>(null);
   const [highlightMenu, setHighlightMenu] = useState<HighlightMenuState | null>(null);
   const [highlightColor, setHighlightColor] = useState<string>(HIGHLIGHT_COLORS[0]?.value ?? "#fce588");
+  const [translationSettings, setTranslationSettings] = useState<TranslationSettings>(() => loadTranslationSettings());
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
   const [selectedAnnotationIds, setSelectedAnnotationIds] = useState<string[]>([]);
 
@@ -943,6 +1243,13 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       setErrorText("window.journalApi is missing. Restart the app.");
     }
   }, [api]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(TRANSLATION_SETTINGS_KEY, JSON.stringify(translationSettings));
+  }, [translationSettings]);
 
   useEffect(() => {
     if (!selectionMenu) {
@@ -1007,6 +1314,19 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     }
     setHighlightMenu((prev) => (prev ? { ...prev, x: next.x, y: next.y } : prev));
   }, [highlightMenu?.x, highlightMenu?.y, highlightMenu?.annotationId]);
+
+  useEffect(() => {
+    if (!isSettingsOpen) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setIsSettingsOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isSettingsOpen]);
 
   function clampScale(next: number): number {
     return Math.max(MIN_SCALE, Math.min(MAX_SCALE, next));
@@ -1199,46 +1519,6 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     setFocusedNoteId(null);
   }, [docId]);
 
-  async function resolveCitationAtPoint(pageNumber: number, pdfX: number, pdfY: number): Promise<void> {
-    if (!docId) {
-      return;
-    }
-
-    setErrorText("");
-    setActivePage(pageNumber);
-
-    const resolved = await api.citationResolve(docId, pageNumber, pdfX, pdfY);
-    if (resolved?.targetId) {
-      await openFigureFromResolved(resolved);
-      return;
-    }
-
-    if (resolved && !resolved.targetId) {
-      setPendingCitation({
-        citationId: resolved.citationId ?? "",
-        kind: resolved.kind,
-        label: resolved.label,
-        page: pageNumber,
-      });
-      setToolMode("manual-bind");
-      setStatusText(`No target found for ${resolved.kind} ${resolved.label}. Drag a region to bind manually.`);
-      return;
-    }
-
-    const resolvedRef = await api.referenceResolve(docId, pageNumber, pdfX, pdfY);
-    if (resolvedRef) {
-      const entries = await api.referenceGetEntries(docId, resolvedRef.indices);
-      await api.referenceOpenPopup({
-        indices: resolvedRef.indices,
-        entries,
-      });
-      setStatusText(`Opened references ${resolvedRef.indices.join(", ")}`);
-      return;
-    }
-
-    setStatusText("Citation/reference not recognized at this point");
-  }
-
   async function openFigureFromResolved(resolved: { targetId: string | null; kind: string; label: string }): Promise<void> {
     if (!docId || !resolved.targetId) {
       return;
@@ -1261,58 +1541,149 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
 
     const candidates = candidatesFromDb.length > 0 ? candidatesFromDb : [fallbackCandidate];
     let chosen: FigureTargetCandidate = candidates[0] ?? fallbackCandidate;
+    let chosenImagePage = chosen.page;
+    let chosenCaptionPage = chosen.page;
+    let chosenCaptionRect = chosen.captionRect;
     let chosenCropRect = chosen.cropRect;
     let chosenDetectionMode: "component" | "fallback" | null = null;
 
     if (pdfDoc) {
       const pageAreaCache = new Map<number, number>();
+      const layoutDetectionCache = new Map<
+        number,
+        Promise<{ rect: Rect; mode: "component"; area: number; score: number } | null>
+      >();
+      const nearDetectionCache = new Map<
+        string,
+        Promise<{ rect: Rect; mode: "component" | "fallback"; area: number; score: number } | null>
+      >();
       let bestScore = Number.NEGATIVE_INFINITY;
 
-      for (const candidate of candidates) {
-        if (!candidate.captionRect) {
-          continue;
+      const getPageArea = async (pageNumber: number): Promise<number> => {
+        let pageArea = pageAreaCache.get(pageNumber);
+        if (pageArea) {
+          return pageArea;
         }
-        const detected = await detectVisualRegionNearCaption(pdfDoc, candidate.page, candidate.captionRect, normalizedKind, {
-          allowFallback: false,
-        });
-        if (!detected || detected.mode !== "component") {
-          continue;
-        }
+        const page = await pdfDoc.getPage(pageNumber);
+        const pageRect = toPdfPageRect(page);
+        pageArea = Math.max(1, pageRect.w * pageRect.h);
+        pageAreaCache.set(pageNumber, pageArea);
+        return pageArea;
+      };
 
-        let pageArea = pageAreaCache.get(candidate.page);
-        if (!pageArea) {
-          const page = await pdfDoc.getPage(candidate.page);
-          const pageRect = toPdfPageRect(page);
-          pageArea = Math.max(1, pageRect.w * pageRect.h);
-          pageAreaCache.set(candidate.page, pageArea);
+      const detectLayout = (pageNumber: number): Promise<{ rect: Rect; mode: "component"; area: number; score: number } | null> => {
+        const cached = layoutDetectionCache.get(pageNumber);
+        if (cached) {
+          return cached;
         }
-        const areaRatio = detected.area / pageArea;
+        const pending = detectVisualRegionByPageLayout(pdfDoc, pageNumber, normalizedKind).catch(() => null);
+        layoutDetectionCache.set(pageNumber, pending);
+        return pending;
+      };
+
+      const detectNearCaption = (
+        candidate: FigureTargetCandidate,
+        allowFallback: boolean,
+      ): Promise<{ rect: Rect; mode: "component" | "fallback"; area: number; score: number } | null> => {
+        if (!candidate.captionRect) {
+          return Promise.resolve(null);
+        }
+        const key = `${candidate.id}:${candidate.page}:${allowFallback ? "1" : "0"}`;
+        const cached = nearDetectionCache.get(key);
+        if (cached) {
+          return cached;
+        }
+        const pending = detectVisualRegionNearCaption(pdfDoc, candidate.page, candidate.captionRect, normalizedKind, {
+          allowFallback,
+        }).catch(() => null);
+        nearDetectionCache.set(key, pending);
+        return pending;
+      };
+
+      const considerCandidate = async (
+        candidate: FigureTargetCandidate,
+        imagePage: number,
+        detection: { rect: Rect; mode: "component" | "fallback"; area: number; score: number },
+        scoreBias = 0,
+      ): Promise<void> => {
+        const pageArea = await getPageArea(imagePage);
+        const areaRatio = detection.area / pageArea;
+        if (areaRatio < 0.01 || areaRatio > 0.94) {
+          return;
+        }
         const exactBonus = candidate.label.toUpperCase() === resolved.label.toUpperCase() ? 0.08 : 0;
         const manualBonus = candidate.source === "manual" ? 1 : 0;
-        const score = areaRatio * 100 + detected.score * 0.01 + candidate.confidence + exactBonus + manualBonus;
+        const score =
+          areaRatio * 130 + detection.score * 0.008 + candidate.confidence + exactBonus + manualBonus + scoreBias;
         if (score > bestScore) {
           bestScore = score;
           chosen = candidate;
-          chosenCropRect = detected.rect;
-          chosenDetectionMode = "component";
+          chosenImagePage = imagePage;
+          chosenCaptionPage = candidate.page;
+          chosenCaptionRect = candidate.captionRect;
+          chosenCropRect = detection.rect;
+          chosenDetectionMode = detection.mode;
+        }
+      };
+
+      for (const candidate of candidates) {
+        const captionPage = Math.max(1, Math.min(pdfDoc.numPages, candidate.page));
+        const looksLikePlaceholder = /\bsee\s+next\s+page\s+for\s+caption\b/i.test(candidate.caption);
+
+        if (candidate.captionRect) {
+          const near = await detectNearCaption(candidate, false);
+          if (near?.mode === "component") {
+            const placeholderPenalty = looksLikePlaceholder ? -6 : 5;
+            await considerCandidate(candidate, captionPage, near, placeholderPenalty);
+          }
+        }
+
+        const probeRadius = looksLikePlaceholder ? 3 : 2;
+        const probePages = new Set<number>([captionPage]);
+        for (let step = 1; step <= probeRadius; step += 1) {
+          if (captionPage - step >= 1) {
+            probePages.add(captionPage - step);
+          }
+          if (captionPage + step <= pdfDoc.numPages) {
+            probePages.add(captionPage + step);
+          }
+        }
+
+        for (const probePage of probePages) {
+          const detected = await detectLayout(probePage);
+          if (!detected) {
+            continue;
+          }
+          const distancePenalty = Math.abs(probePage - captionPage) * (normalizedKind === "table" ? 4.5 : 5.8);
+          const forwardBonus = looksLikePlaceholder && probePage > captionPage ? 8 : 0;
+          const samePagePlaceholderPenalty = looksLikePlaceholder && probePage === captionPage ? -9 : 0;
+          await considerCandidate(candidate, probePage, detected, forwardBonus + samePagePlaceholderPenalty - distancePenalty);
         }
       }
 
       if (chosenDetectionMode !== "component" && chosen.captionRect) {
-        const detected = await detectVisualRegionNearCaption(pdfDoc, chosen.page, chosen.captionRect, normalizedKind, {
-          allowFallback: true,
-        });
-        if (detected) {
-          chosenCropRect = detected.rect;
-          chosenDetectionMode = detected.mode;
+        const fallbackDetected = await detectNearCaption(chosen, true);
+        if (fallbackDetected) {
+          chosenImagePage = chosen.page;
+          chosenCaptionPage = chosen.page;
+          chosenCaptionRect = chosen.captionRect;
+          chosenCropRect = fallbackDetected.rect;
+          chosenDetectionMode = fallbackDetected.mode;
         }
       }
     }
 
     const target = chosen.id === resolved.targetId ? fallbackTarget : await api.figureGetTarget(docId, chosen.id);
     let imageDataUrl = target.imageDataUrl;
+    let pageImageDataUrl: string | undefined;
+    let popupPageRect: Rect | undefined;
     if (pdfDoc) {
-      const rendered = await renderTargetCropImage(pdfDoc, chosen.page, chosenCropRect, {
+      const pageImage = await renderPageImage(pdfDoc, chosenImagePage).catch(() => null);
+      if (pageImage) {
+        pageImageDataUrl = pageImage.imageDataUrl;
+        popupPageRect = pageImage.pageRect;
+      }
+      const rendered = await renderTargetCropImage(pdfDoc, chosenImagePage, chosenCropRect, {
         trim: chosenDetectionMode === "component",
       }).catch(() => null);
       if (rendered) {
@@ -1325,8 +1696,12 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       targetId: chosen.id,
       caption: chosen.caption,
       imageDataUrl,
-      page: chosen.page,
-      captionRect: chosen.captionRect,
+      pageImageDataUrl,
+      page: chosenImagePage,
+      pageRect: popupPageRect,
+      focusRect: chosenCropRect,
+      captionPage: chosenCaptionPage,
+      captionRect: chosenCaptionRect,
     });
     setPendingCitation(null);
     const modeNote =
@@ -1426,6 +1801,51 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     }
   }
 
+  async function translateFromSelectionMenu(): Promise<void> {
+    if (!selectionMenu) {
+      return;
+    }
+    const text = selectionMenu.text.trim();
+    if (!text) {
+      setSelectionMenu(null);
+      return;
+    }
+    try {
+      setErrorText("");
+      setStatusText("Translating selection...");
+      const translated = await api.translateText({
+        text,
+        sourceLang: translationSettings.sourceLang,
+        targetLang: translationSettings.targetLang,
+        provider: translationSettings.provider,
+      });
+      await api.translateOpenPopup({
+        sourceText: text,
+        translatedText: translated.translatedText,
+        provider: translated.provider,
+        sourceLang: translated.sourceLang,
+        targetLang: translated.targetLang,
+        detectedSourceLang: translated.detectedSourceLang,
+      });
+      setStatusText(`Translation opened (${translated.provider})`);
+    } catch (error) {
+      const reason = formatError(error);
+      const browserUrl = `https://translate.google.com/?sl=${encodeURIComponent(
+        translationSettings.sourceLang || "auto",
+      )}&tl=${encodeURIComponent(translationSettings.targetLang || "en")}&text=${encodeURIComponent(text)}&op=translate`;
+      try {
+        await api.openExternal(browserUrl);
+        setStatusText("Opened translation in browser");
+        setErrorText("");
+      } catch {
+        setStatusText("Translation failed");
+        setErrorText(reason);
+      }
+    } finally {
+      setSelectionMenu(null);
+    }
+  }
+
   async function openReferenceFromSelection(): Promise<void> {
     if (!docId || !selectionMenu) {
       return;
@@ -1512,6 +1932,26 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       setStatusText("Failed to open figure/table from selection");
       setErrorText(formatError(error));
       setSelectionMenu(null);
+    }
+  }
+
+  async function openRecognizedPopup(kind: RecognizedPopupKind): Promise<void> {
+    if (!docId) {
+      return;
+    }
+    try {
+      setErrorText("");
+      const opened = await api.recognizedOpenPopup(docId, kind);
+      if (!opened) {
+        setStatusText("Recognized list is currently unavailable");
+        setErrorText("Could not open recognized popup window. Please restart the app and try again.");
+        return;
+      }
+      const label = kind === "ref" ? "references" : kind;
+      setStatusText(`Opened recognized ${label}`);
+    } catch (error) {
+      setStatusText("Failed to open recognized list");
+      setErrorText(formatError(error));
     }
   }
 
@@ -1813,7 +2253,7 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
             >
               <IconGlyph d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5" />
             </ToolButton>
-            <ToolButton title="Pointer mode (click citations/references)" active={toolMode === "none"} onClick={() => setToolMode("none")}>
+            <ToolButton title="Pointer mode (select and right-click for actions)" active={toolMode === "none"} onClick={() => setToolMode("none")}>
               <IconGlyph d="M5 3l6 16 2-6 6-2z" />
             </ToolButton>
             <ToolButton
@@ -1851,6 +2291,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
             <ToolButton title="Discard unsaved edits and reload annotations from PDF" onClick={() => void refreshAnnotations()}>
               <IconGlyph d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5M8 9h5M8 13h7" />
             </ToolButton>
+            <ToolButton title="Translation settings" onClick={() => setIsSettingsOpen(true)}>
+              <IconGlyph d="M12 3v2M12 19v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M3 12h2M19 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8" />
+            </ToolButton>
           </div>
 
           {pdfDoc ? (
@@ -1885,7 +2328,6 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
                 toolMode={toolMode}
                 annotations={annotationsByPage.get(pageNumber) ?? []}
                 onActivate={setActivePage}
-                onCitationClick={resolveCitationAtPoint}
                 onCreateHighlight={createHighlight}
                 onCreateTextNote={createTextNote}
                 onCreateSticky={createSticky}
@@ -1910,11 +2352,25 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       </div>
 
       <div className="footer">
-        <div>
-          {stats
-            ? `recognized -> refs ${stats.refsCount} | fig ${stats.figuresCount} | table ${stats.tablesCount} | supp ${stats.suppCount}`
-            : "recognized -> (not parsed yet)"}
-        </div>
+        {stats ? (
+          <div className="recognized-bar">
+            <span className="recognized-label">recognized</span>
+            <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("ref")}>
+              refs {stats.refsCount}
+            </button>
+            <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("fig")}>
+              fig {stats.figuresCount}
+            </button>
+            <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("table")}>
+              table {stats.tablesCount}
+            </button>
+            <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("supp")}>
+              supp {stats.suppCount}
+            </button>
+          </div>
+        ) : (
+          <div>{"recognized -> (not parsed yet)"}</div>
+        )}
       </div>
 
       {selectionMenu ? (
@@ -1937,6 +2393,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
           </button>
           <button className="selection-menu-item" onClick={() => void searchFromSelectionMenu()}>
             Search with Google
+          </button>
+          <button className="selection-menu-item" onClick={() => void translateFromSelectionMenu()}>
+            Translate Selection
           </button>
           <div className="selection-menu-sep" />
           <button className="selection-menu-item" onClick={() => void openFigureFromSelection()}>
@@ -1981,6 +2440,89 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
           </button>
         </div>
       ) : null}
+
+      {isSettingsOpen ? (
+        <div
+          className="settings-overlay"
+          onClick={() => setIsSettingsOpen(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
+        >
+          <div
+            className="settings-panel"
+            onClick={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <div className="settings-head">
+              <div className="settings-title">Settings</div>
+              <button type="button" className="settings-close" onClick={() => setIsSettingsOpen(false)}>
+                ×
+              </button>
+            </div>
+
+            <div className="settings-section">
+              <div className="settings-subtitle">Translation</div>
+              <label className="settings-field">
+                <span>Provider</span>
+                <select
+                  value={translationSettings.provider}
+                  onChange={(event) =>
+                    setTranslationSettings((prev) => ({
+                      ...prev,
+                      provider: event.target.value as TranslateProvider,
+                    }))
+                  }
+                >
+                  {TRANSLATION_PROVIDERS.map((provider) => (
+                    <option key={provider.value} value={provider.value}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>Source language</span>
+                <select
+                  value={translationSettings.sourceLang}
+                  onChange={(event) =>
+                    setTranslationSettings((prev) => ({
+                      ...prev,
+                      sourceLang: event.target.value,
+                    }))
+                  }
+                >
+                  {TRANSLATION_LANGUAGES.map((lang) => (
+                    <option key={lang.value} value={lang.value}>
+                      {lang.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>Target language</span>
+                <select
+                  value={translationSettings.targetLang}
+                  onChange={(event) =>
+                    setTranslationSettings((prev) => ({
+                      ...prev,
+                      targetLang: event.target.value,
+                    }))
+                  }
+                >
+                  {TRANSLATION_LANGUAGES.filter((lang) => lang.value !== "auto").map((lang) => (
+                    <option key={lang.value} value={lang.value}>
+                      {lang.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="settings-hint">Used by right-click menu: Translate Selection</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1993,7 +2535,6 @@ function PdfPageSurface({
   toolMode,
   annotations,
   onActivate,
-  onCitationClick,
   onCreateHighlight,
   onCreateTextNote,
   onCreateSticky,
@@ -2017,7 +2558,6 @@ function PdfPageSurface({
   toolMode: ToolMode;
   annotations: AnnotationItem[];
   onActivate: (pageNumber: number) => void;
-  onCitationClick: (pageNumber: number, pdfX: number, pdfY: number) => Promise<void>;
   onCreateHighlight: (pageNumber: number, rects: Rect[], selectedText?: string) => Promise<void>;
   onCreateTextNote: (pageNumber: number, point: { x: number; y: number }) => Promise<void>;
   onCreateSticky: (pageNumber: number, point: { x: number; y: number }) => Promise<void>;
@@ -2204,8 +2744,7 @@ function PdfPageSurface({
       const height = "height" in item ? item.height * scale : 12;
 
       span.textContent = item.str;
-      const citationSpan = isCitationToken(item.str);
-      span.className = `text-span${citationSpan ? " citation" : ""}`;
+      span.className = "text-span";
       span.style.left = `${tx[4]}px`;
       span.style.top = `${tx[5] - height}px`;
       span.style.fontSize = `${height}px`;
@@ -2215,25 +2754,6 @@ function PdfPageSurface({
     }
     textLayer.appendChild(fragment);
 
-    if (toolMode === "none") {
-      textLayer.onclick = (event: MouseEvent): void => {
-        const target = (event.target as HTMLElement | null)?.closest(".text-span.citation");
-        if (!target) {
-          return;
-        }
-        event.stopPropagation();
-        const wrap = pageWrapRef.current;
-        if (!wrap) {
-          return;
-        }
-        onActivate(pageNumber);
-        const wrapRect = wrap.getBoundingClientRect();
-        const viewportX = event.clientX - wrapRect.left;
-        const viewportY = event.clientY - wrapRect.top;
-        const [pdfX, pdfY] = viewport.convertToPdfPoint(viewportX, viewportY);
-        void onCitationClick(pageNumber, pdfX, pdfY);
-      };
-    }
   }
 
   function intersectsWrap(rect: DOMRect, wrapRect: DOMRect): boolean {

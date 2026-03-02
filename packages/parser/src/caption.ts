@@ -56,9 +56,20 @@ function inferLayoutRectForCaption(
 ): Rect | null {
   const capTop = captionRect.y + captionRect.h;
   const capBottom = captionRect.y;
-  const xPad = Math.max(20, captionRect.h * 2.4);
-  const x0 = Math.max(0, captionRect.x - xPad);
-  const x1 = Math.max(x0 + 30, captionRect.x + captionRect.w + xPad);
+  const pageMinX = Math.min(...pageLines.map((line) => line.bbox.x), captionRect.x);
+  const pageMaxX = Math.max(...pageLines.map((line) => line.bbox.x + line.bbox.w), captionRect.x + captionRect.w);
+  const pageTextWidth = Math.max(1, pageMaxX - pageMinX);
+  const xPad = Math.max(24, captionRect.h * 2.8);
+  let x0 = captionRect.x - xPad;
+  let x1 = captionRect.x + captionRect.w + xPad;
+  const minProbeWidth = Math.max(captionRect.w + 140, pageTextWidth * (preferBelow ? 0.56 : 0.7));
+  if (x1 - x0 < minProbeWidth) {
+    const cx = captionRect.x + captionRect.w / 2;
+    x0 = cx - minProbeWidth / 2;
+    x1 = cx + minProbeWidth / 2;
+  }
+  x0 = Math.max(0, Math.min(x0, pageMinX - 16));
+  x1 = Math.max(x0 + 30, Math.max(x1, pageMaxX + 16));
   const probeRect: Rect = { x: x0, y: captionRect.y, w: x1 - x0, h: captionRect.h };
 
   const blockSet = new Set(block);
@@ -96,6 +107,75 @@ function inferLayoutRectForCaption(
     w: x1 - x0,
     h: Math.max(20, h - 4),
   };
+}
+
+function splitCaptionHeadAndBody(rawCaption: string): { head: string; body: string } {
+  const idx = rawCaption.indexOf(":");
+  if (idx < 0) {
+    return { head: rawCaption.trim(), body: "" };
+  }
+  return {
+    head: rawCaption.slice(0, idx).trim(),
+    body: rawCaption.slice(idx + 1).trim(),
+  };
+}
+
+function isNextPagePlaceholder(body: string): boolean {
+  const normalized = body.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return true;
+  }
+  return /^(see\s+next\s+page(?:\s+for\s+caption)?|caption\s+continued\s+on\s+next\s+page)\.?$/i.test(normalized);
+}
+
+function mergeCrossPageSameLabelCaptions(captions: ParsedCaption[]): ParsedCaption[] {
+  if (captions.length < 2) {
+    return captions;
+  }
+  const sorted = [...captions].sort((a, b) => {
+    if (a.kind !== b.kind) {
+      return a.kind.localeCompare(b.kind);
+    }
+    if (a.label !== b.label) {
+      return a.label.localeCompare(b.label);
+    }
+    return a.page - b.page;
+  });
+
+  const drop = new Set<number>();
+  for (let i = 0; i < sorted.length - 1; i += 1) {
+    const current = sorted[i];
+    const next = sorted[i + 1];
+    if (!current || !next) {
+      continue;
+    }
+    if (current.kind !== next.kind || current.label !== next.label) {
+      continue;
+    }
+    if (next.page > current.page + 2) {
+      continue;
+    }
+
+    const currentParts = splitCaptionHeadAndBody(current.caption);
+    const nextParts = splitCaptionHeadAndBody(next.caption);
+    const currentBody = currentParts.body;
+    const nextBody = nextParts.body;
+    if (!isNextPagePlaceholder(currentBody)) {
+      continue;
+    }
+    if (!nextBody || nextBody.length <= currentBody.length + 8) {
+      continue;
+    }
+
+    sorted[i] = {
+      ...current,
+      caption: `${currentParts.head}: ${nextBody}`.trim(),
+      quality: Math.max(current.quality ?? 0.65, next.quality ?? 0.65),
+    };
+    drop.add(i + 1);
+  }
+
+  return sorted.filter((_item, idx) => !drop.has(idx)).sort((a, b) => a.page - b.page);
 }
 
 function splitPageColumns(pageSpans: ParsedTextSpan[]): ParsedTextSpan[][] {
@@ -619,5 +699,5 @@ export function extractCaptions(spans: ParsedTextSpan[]): ParsedCaption[] {
     skipUntil = i + block.length;
   }
 
-  return captions;
+  return mergeCrossPageSameLabelCaptions(captions);
 }
