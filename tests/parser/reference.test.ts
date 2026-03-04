@@ -172,4 +172,56 @@ describe("extractReferenceData", () => {
     expect(out.entries.some((entry) => entry.index === 1)).toBe(false);
     expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([2, 3]));
   });
+
+  it("extracts entries when references are split across two distant sections", () => {
+    const spans = [
+      { text: "We observed consistent behavior [5].", page: 2, bbox: { x: 20, y: 700, w: 280, h: 16 } },
+      { text: "References", page: 10, bbox: { x: 20, y: 760, w: 120, h: 16 } },
+      { text: "1. Alpha, A. et al. First study (2019).", page: 10, bbox: { x: 20, y: 738, w: 420, h: 14 } },
+      { text: "2. Beta, B. et al. Second study (2020).", page: 10, bbox: { x: 20, y: 720, w: 420, h: 14 } },
+      { text: "3. Gamma, C. et al. Third study (2021).", page: 10, bbox: { x: 20, y: 702, w: 420, h: 14 } },
+      { text: "Supplementary text body here.", page: 14, bbox: { x: 20, y: 720, w: 320, h: 14 } },
+      { text: "References", page: 20, bbox: { x: 20, y: 760, w: 120, h: 16 } },
+      { text: "4. Delta, D. et al. Fourth study (2022).", page: 20, bbox: { x: 20, y: 738, w: 420, h: 14 } },
+      { text: "5. Epsilon, E. et al. Fifth study (2023).", page: 20, bbox: { x: 20, y: 720, w: 420, h: 14 } },
+      { text: "6. Zeta, Z. et al. Sixth study (2024).", page: 20, bbox: { x: 20, y: 702, w: 420, h: 14 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref-split");
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([1, 2, 3, 4, 5, 6]));
+  });
+
+  it("parses detached reference numbers when index and body are split into separate lines", () => {
+    const spans = [
+      { text: "References", page: 5, bbox: { x: 20, y: 760, w: 120, h: 16 } },
+      { text: "49. Alpha et al. Penultimate entry (2024).", page: 5, bbox: { x: 20, y: 738, w: 420, h: 14 } },
+      { text: "50.", page: 5, bbox: { x: 20, y: 720, w: 24, h: 14 } },
+      { text: "Beta et al. Final entry with detached index (2025).", page: 5, bbox: { x: 36, y: 702, w: 460, h: 14 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref-detached");
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([49, 50]));
+    expect(out.entries.find((entry) => entry.index === 50)?.text).toContain("detached index");
+  });
+
+  it("recovers numbered entries when index token is a separate span from reference body", () => {
+    const spans = [
+      { text: "Any methods, additional references", page: 9, bbox: { x: 32, y: 760, w: 220, h: 8 } },
+      { text: "1.", page: 9, bbox: { x: 304, y: 736, w: 8, h: 6 } },
+      { text: "Sorrells, S. F. et al. Positive controls in adults (2021).", page: 9, bbox: { x: 320, y: 736, w: 260, h: 6 } },
+      { text: "2.", page: 9, bbox: { x: 304, y: 720, w: 8, h: 6 } },
+      { text: "Paredes, M. F. et al. Human hippocampus study (2018).", page: 9, bbox: { x: 320, y: 720, w: 258, h: 6 } },
+      { text: "3.", page: 9, bbox: { x: 304, y: 704, w: 8, h: 6 } },
+      { text: "Tobin, M. K. et al. Aging neurogenesis in humans (2019).", page: 9, bbox: { x: 320, y: 704, w: 262, h: 6 } },
+      { text: "4.", page: 9, bbox: { x: 304, y: 688, w: 8, h: 6 } },
+      { text: "Terreros-Roncal, J. et al. Methods review (2023).", page: 9, bbox: { x: 320, y: 688, w: 246, h: 6 } },
+      { text: "5.", page: 9, bbox: { x: 304, y: 672, w: 8, h: 6 } },
+      { text: "Gallardo-Caballero, M. et al. Fixation delay impact (2023).", page: 9, bbox: { x: 320, y: 672, w: 274, h: 6 } },
+      { text: "39.", page: 10, bbox: { x: 40, y: 736, w: 14, h: 6 } },
+      { text: "Anderson, A. G. et al. Single nucleus multiomics (2023).", page: 10, bbox: { x: 56, y: 736, w: 284, h: 6 } },
+    ];
+
+    const out = extractReferenceData(spans, "doc-ref-span-split");
+    expect(out.entries.map((entry) => entry.index)).toEqual(expect.arrayContaining([1, 2, 3, 4, 5, 39]));
+  });
 });

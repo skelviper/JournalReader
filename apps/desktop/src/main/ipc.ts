@@ -2,7 +2,7 @@ import { app, ipcMain, BrowserWindow, dialog, shell } from "electron";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { extractCitations, extractCaptions, extractReferenceData, mapCitationsToTargets } from "@journal-reader/parser";
+import { extractCitations, extractCaptions, extractReferenceData, inferReferenceCount, mapCitationsToTargets } from "@journal-reader/parser";
 import {
   buildTargetPreviewDataUrl,
   extractTextSpans,
@@ -71,6 +71,10 @@ function normalizeAnnotationPayload(item: AnnotationItem, docId: string): Annota
     createdAt: item.createdAt || now,
     updatedAt: item.updatedAt || item.createdAt || now,
   };
+}
+
+function isExtendedDataCaption(text: string): boolean {
+  return /^\s*extended\s+data\s+fig(?:ure)?\b/i.test(text);
 }
 
 async function ensureAnnotationsLoaded(repo: StorageRepository, docId: string): Promise<AnnotationItem[]> {
@@ -971,6 +975,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         refsCount: 0,
         figuresCount: 0,
         tablesCount: 0,
+        extCount: 0,
         suppCount: 0,
       };
     }
@@ -989,9 +994,17 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     repo.replaceCitationMappings(mapped.citationsToTarget);
 
     const stats = repo.stats(docId);
+    const extCount = mapped.targets.filter(
+      (target) => target.kind === "supplementary" && isExtendedDataCaption(target.caption ?? ""),
+    ).length;
+    const refsCount = inferReferenceCount(references.entries, references.markers);
     return {
       status: "ok" as const,
-      ...stats,
+      refsCount,
+      figuresCount: stats.figuresCount,
+      tablesCount: stats.tablesCount,
+      extCount,
+      suppCount: Math.max(0, stats.suppCount - extCount),
     };
   });
 
@@ -1106,14 +1119,22 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             )
             .join("");
         } else {
-          const targetKind = kind === "fig" ? "figure" : kind === "supp" ? "supplementary" : "table";
+          const targetKind = kind === "fig" ? "figure" : kind === "table" ? "table" : "supplementary";
           title =
             kind === "fig"
               ? "Recognized Figures"
+              : kind === "ext"
+                ? "Recognized Extended Data Figures"
               : kind === "supp"
                 ? "Recognized Supplementary Figures/Tables"
                 : "Recognized Tables";
-          const targets = repo.listTargetsByKind(docId, targetKind);
+          const allTargets = repo.listTargetsByKind(docId, targetKind);
+          const targets =
+            kind === "ext"
+              ? allTargets.filter((target) => isExtendedDataCaption(typeof target.caption === "string" ? target.caption : ""))
+              : kind === "supp"
+                ? allTargets.filter((target) => !isExtendedDataCaption(typeof target.caption === "string" ? target.caption : ""))
+                : allTargets;
           rows = targets
             .map((target) => {
               const caption = normalizeSnippet(typeof target.caption === "string" ? target.caption : "").slice(0, 600);
@@ -1194,14 +1215,21 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       .wrap{display:grid;grid-template-rows:minmax(0,1fr) auto;gap:12px;height:100%}
       .img-wrap{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px;display:flex;flex-direction:column;min-height:0;min-width:0}
       .img-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;min-width:0}
-      .img-toolbar button{border:1px solid #c1ccdc;background:#fff;border-radius:8px;padding:5px 10px;cursor:pointer}
-      .img-toolbar .zoom{font-size:13px;color:#4d6179;min-width:52px;text-align:right}
-      .img-toolbar .hint{font-size:12px;color:#5b6d84;flex:1 1 100%;min-width:0;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      .tool-group{display:inline-flex;align-items:center;gap:4px;border:1px solid #ccd7e7;border-radius:9px;background:#eef3fa;padding:3px}
-      .tool-group .tool{padding:4px 8px;font-size:12px}
-      .tool-group .tool.active{border-color:#2d5f9e;background:#dce9fb}
-      .swatches{display:inline-flex;align-items:center;gap:5px;margin-left:6px}
-      .swatch{width:16px;height:16px;border-radius:50%;border:1px solid #a5b2c3;padding:0}
+      .toolbar-group{display:inline-flex;align-items:center;gap:6px;padding:4px;border:1px solid #ccd7e7;border-radius:12px;background:#eef3fa}
+      .icon-btn{width:34px;height:30px;border:1px solid #bcc6d4;background:#fff;border-radius:8px;padding:0;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:#2b3848}
+      .icon-btn:hover{background:#f7f9fc}
+      .icon-btn.active{border-color:#2d5f9e;background:#dce9fb}
+      .icon-btn svg{width:17px;height:17px;stroke:currentColor;stroke-width:1.8;fill:none;stroke-linecap:round;stroke-linejoin:round}
+      .zoom-reset{min-width:76px;padding:0 10px;font-variant-numeric:tabular-nums}
+      .zoom{font-size:13px;color:#4d6179;min-width:52px;text-align:right;font-variant-numeric:tabular-nums}
+      .img-toolbar .hint{font-size:12px;color:#5b6d84;flex:1 1 220px;min-width:120px;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .tool-group{display:inline-flex;align-items:center;gap:4px}
+      .tool{width:34px;height:30px;border:1px solid #bcc6d4;background:#fff;border-radius:8px;padding:0;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:#2b3848}
+      .tool:hover{background:#f7f9fc}
+      .tool svg{width:17px;height:17px;stroke:currentColor;stroke-width:1.8;fill:none;stroke-linecap:round;stroke-linejoin:round}
+      .tool.active{border-color:#2d5f9e;background:#dce9fb}
+      .swatches{display:inline-flex;align-items:center;gap:5px}
+      .swatch{width:16px;height:16px;border-radius:50%;border:1px solid #a5b2c3;padding:0;cursor:pointer}
       .swatch.active{box-shadow:0 0 0 2px #2d5f9e}
       .img-stage{border:1px solid #d4deea;border-radius:8px;overflow:hidden;min-height:0;flex:1;background:#f7f9fc;min-width:0;max-width:100%}
       .canvas-wrap{position:relative;display:block;width:max-content;height:max-content}
@@ -1240,7 +1268,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
       .cap-tools button:disabled{opacity:0.5;cursor:not-allowed}
       .cap-hint{font-size:12px;color:#5b6d84}
       </style></head>
-      <body><div class=\"wrap\"><div class=\"img-wrap\"><div class=\"img-toolbar\"><button id=\"zoomOut\" type=\"button\" title=\"Zoom out\">-</button><button id=\"zoomReset\" type=\"button\" title=\"Reset zoom\">100%</button><button id=\"zoomIn\" type=\"button\" title=\"Zoom in\">+</button><div class=\"zoom\" id=\"zoomText\">100%</div><div class=\"tool-group\" id=\"annotationTools\"><button id=\"toolPointer\" class=\"tool active\" type=\"button\" title=\"Pointer mode\">Pointer</button><button id=\"toolHighlight\" class=\"tool\" type=\"button\" title=\"Highlight mode\">Highlight</button><button id=\"toolText\" class=\"tool\" type=\"button\" title=\"Text note mode\">Text</button><button id=\"toolSticky\" class=\"tool\" type=\"button\" title=\"Sticky note mode\">Sticky</button></div><div class=\"swatches\" id=\"highlightColors\"><button class=\"swatch active\" data-color=\"#fce588\" type=\"button\" title=\"Yellow highlight\" style=\"background:#fce588\"></button><button class=\"swatch\" data-color=\"#b8f3b4\" type=\"button\" title=\"Green highlight\" style=\"background:#b8f3b4\"></button><button class=\"swatch\" data-color=\"#f9c5e5\" type=\"button\" title=\"Pink highlight\" style=\"background:#f9c5e5\"></button><button class=\"swatch\" data-color=\"#b9d9ff\" type=\"button\" title=\"Blue highlight\" style=\"background:#b9d9ff\"></button></div><div class=\"hint\" id=\"locHint\"></div></div><div class=\"img-stage\" id=\"imgStage\"><div class=\"canvas-wrap\" id=\"canvasWrap\"><img id=\"targetImage\" src=\"${payload.pageImageDataUrl ?? payload.imageDataUrl}\" alt=\"target\"/><div class=\"ann-layer\" id=\"annLayer\"></div><div class=\"ann-preview\" id=\"annPreview\"></div></div></div></div><div class=\"cap\"><div id=\"captionText\">${safeCaptionToHtml(
+      <body><div class=\"wrap\"><div class=\"img-wrap\"><div class=\"img-toolbar\"><div class=\"toolbar-group\"><button id=\"zoomOut\" class=\"icon-btn\" type=\"button\" title=\"Zoom out\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 12h14\"/></svg></button><button id=\"zoomReset\" class=\"icon-btn zoom-reset\" type=\"button\" title=\"Reset zoom\">100%</button><button id=\"zoomIn\" class=\"icon-btn\" type=\"button\" title=\"Zoom in\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 12h14M12 5v14\"/></svg></button><div class=\"zoom\" id=\"zoomText\">100%</div></div><div class=\"toolbar-group tool-group\" id=\"modeTools\"><button id=\"toolPointer\" class=\"tool active\" type=\"button\" title=\"Pointer mode\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 3l6 16 2-6 6-2z\"/></svg></button><button id=\"toolGrab\" class=\"tool\" type=\"button\" title=\"Grab mode\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M7 11V6a1 1 0 0 1 2 0v5M10 11V5a1 1 0 0 1 2 0v6M13 11V6a1 1 0 0 1 2 0v5M16 12V8a1 1 0 0 1 2 0v6a6 6 0 0 1-6 6h-1a6 6 0 0 1-6-6v-2a2 2 0 0 1 2-2z\"/></svg></button></div><div class=\"toolbar-group tool-group\" id=\"annotationTools\"><button id=\"toolHighlight\" class=\"tool\" type=\"button\" title=\"Highlight mode\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M3 17h10m4-10 4 4-7 7H10V14z\"/></svg></button><button id=\"toolText\" class=\"tool\" type=\"button\" title=\"Text note mode\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 5h14v10H9l-4 4zM8 9h8M8 12h6\"/></svg></button><button id=\"toolSticky\" class=\"tool\" type=\"button\" title=\"Sticky note mode\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M5 4h14v14l-4-3-4 3-4-3-2 2z\"/></svg></button></div><div class=\"swatches\" id=\"highlightColors\"><button class=\"swatch active\" data-color=\"#fce588\" type=\"button\" title=\"Yellow highlight\" style=\"background:#fce588\"></button><button class=\"swatch\" data-color=\"#b8f3b4\" type=\"button\" title=\"Green highlight\" style=\"background:#b8f3b4\"></button><button class=\"swatch\" data-color=\"#f9c5e5\" type=\"button\" title=\"Pink highlight\" style=\"background:#f9c5e5\"></button><button class=\"swatch\" data-color=\"#b9d9ff\" type=\"button\" title=\"Blue highlight\" style=\"background:#b9d9ff\"></button></div><div class=\"hint\" id=\"locHint\"></div></div><div class=\"img-stage\" id=\"imgStage\"><div class=\"canvas-wrap\" id=\"canvasWrap\"><img id=\"targetImage\" src=\"${payload.pageImageDataUrl ?? payload.imageDataUrl}\" alt=\"target\"/><div class=\"ann-layer\" id=\"annLayer\"></div><div class=\"ann-preview\" id=\"annPreview\"></div></div></div></div><div class=\"cap\"><div id=\"captionText\">${safeCaptionToHtml(
       payload.caption,
     )}</div><div class=\"cap-tools\"><button id=\"captionHighlight\" type=\"button\" title=\"Create linked highlight from selected caption text\">Highlight Selection</button><button id=\"captionClear\" type=\"button\" title=\"Remove all linked caption highlights for this figure\">Clear Caption Highlights</button><div class=\"cap-hint\" id=\"capHint\">Select text in caption, then click Highlight Selection.</div></div></div></div>
     <script>
@@ -1258,6 +1286,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         const zoomReset = document.getElementById('zoomReset');
         const locHint = document.getElementById('locHint');
         const toolPointer = document.getElementById('toolPointer');
+        const toolGrab = document.getElementById('toolGrab');
         const toolHighlight = document.getElementById('toolHighlight');
         const toolText = document.getElementById('toolText');
         const toolSticky = document.getElementById('toolSticky');
@@ -1278,6 +1307,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           !zoomReset ||
           !locHint ||
           !toolPointer ||
+          !toolGrab ||
           !toolHighlight ||
           !toolText ||
           !toolSticky ||
@@ -1295,6 +1325,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         const minScale = 0.5;
         const maxScale = 3.2;
         let toolMode = 'pointer';
+        let interactionMode = 'pointer';
         let highlightColor = '#fce588';
         const originalCaptionHtml = captionTextEl.innerHTML;
         let linkedSnippets = [];
@@ -1457,16 +1488,22 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             locHint.textContent = 'Sticky mode: click to place a sticky note.';
             return;
           }
+          if (interactionMode === 'grab') {
+            locHint.textContent = 'Grab mode: drag to pan the image.';
+            return;
+          }
           locHint.textContent = meta.fullPageMode
             ? 'Full-page preview.'
             : 'Pointer mode';
         };
         const applyToolUi = () => {
-          toolPointer.classList.toggle('active', toolMode === 'pointer');
+          toolPointer.classList.toggle('active', toolMode === 'pointer' && interactionMode === 'pointer');
+          toolGrab.classList.toggle('active', toolMode === 'pointer' && interactionMode === 'grab');
           toolHighlight.classList.toggle('active', toolMode === 'highlight');
           toolText.classList.toggle('active', toolMode === 'text-note');
           toolSticky.classList.toggle('active', toolMode === 'sticky-note');
           toolPointer.disabled = !canEditPageAnnotations;
+          toolGrab.disabled = !canEditPageAnnotations;
           toolHighlight.disabled = !canEditPageAnnotations;
           toolText.disabled = !canEditPageAnnotations;
           toolSticky.disabled = !canEditPageAnnotations;
@@ -1475,7 +1512,17 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         };
         const setToolMode = (mode) => {
           if (!canEditPageAnnotations) return;
+          if (mode !== 'pointer') {
+            interactionMode = 'pointer';
+          }
           toolMode = mode;
+          applyToolUi();
+          setStageCursor();
+        };
+        const setInteractionMode = (mode) => {
+          if (!canEditPageAnnotations) return;
+          interactionMode = mode === 'grab' ? 'grab' : 'pointer';
+          toolMode = 'pointer';
           applyToolUi();
           setStageCursor();
         };
@@ -1812,7 +1859,11 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             stage.style.cursor = 'copy';
             return;
           }
-          stage.style.cursor = meta.fullPageMode || scale > 1.001 ? 'grab' : 'default';
+          if (!canEditPageAnnotations) {
+            stage.style.cursor = meta.fullPageMode || scale > 1.001 ? 'grab' : 'default';
+            return;
+          }
+          stage.style.cursor = interactionMode === 'grab' ? 'grab' : 'default';
         };
         const computeBaseDisplaySize = () => {
           const naturalWidth = img.naturalWidth || 1;
@@ -2064,7 +2115,8 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           }
         };
 
-        toolPointer.addEventListener('click', () => setToolMode('pointer'));
+        toolPointer.addEventListener('click', () => setInteractionMode('pointer'));
+        toolGrab.addEventListener('click', () => setInteractionMode('grab'));
         toolHighlight.addEventListener('click', () => setToolMode('highlight'));
         toolText.addEventListener('click', () => setToolMode('text-note'));
         toolSticky.addEventListener('click', () => setToolMode('sticky-note'));
@@ -2112,11 +2164,17 @@ export function registerIpcHandlers(repo: StorageRepository): void {
           }
           event.preventDefault();
           event.stopPropagation();
-          wheelPending = {
-            deltaY: event.deltaY,
-            clientX: event.clientX,
-            clientY: event.clientY,
-          };
+          if (wheelPending) {
+            wheelPending.deltaY += event.deltaY;
+            wheelPending.clientX = event.clientX;
+            wheelPending.clientY = event.clientY;
+          } else {
+            wheelPending = {
+              deltaY: event.deltaY,
+              clientX: event.clientX,
+              clientY: event.clientY,
+            };
+          }
           if (wheelThrottleRaf !== null) {
             return;
           }
@@ -2131,7 +2189,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             if ((currentScale >= maxScale - 0.0001 && delta < 0) || (currentScale <= minScale + 0.0001 && delta > 0)) {
               return;
             }
-            const gain = currentScale > 1 ? 0.0011 : 0.0013;
+            const gain = currentScale > 1 ? 0.00105 : 0.00122;
             const zoomFactor = Math.exp(-delta * gain);
             const nextScale = clampScale(currentScale * zoomFactor);
             if (Math.abs(nextScale - currentScale) < 0.0005) return;
@@ -2143,10 +2201,10 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         }, { passive: false });
 
         zoomIn.addEventListener('click', () => {
-          zoomAt(scale + 0.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
+          zoomAt(scale * 1.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
         });
         zoomOut.addEventListener('click', () => {
-          zoomAt(scale - 0.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
+          zoomAt(scale / 1.08, stage.clientWidth * 0.5, stage.clientHeight * 0.5, false);
         });
         zoomReset.addEventListener('click', () => {
           scale = initialScale;
@@ -2217,7 +2275,11 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             event.preventDefault();
             return;
           }
-          if (!meta.fullPageMode && scale <= 1.001) return;
+          const canPanByMode = canEditPageAnnotations ? toolMode === 'pointer' && interactionMode === 'grab' : meta.fullPageMode || scale > 1.001;
+          if (!canPanByMode) return;
+          const maxLeft = Math.max(0, stage.scrollWidth - stage.clientWidth);
+          const maxTop = Math.max(0, stage.scrollHeight - stage.clientHeight);
+          if (maxLeft <= 0.5 && maxTop <= 0.5) return;
           panDragging = true;
           dragStartX = event.clientX;
           dragStartY = event.clientY;
@@ -2422,7 +2484,6 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         applyToolUi();
         render();
         void loadLinkedAnnotation();
-        void loadPageAnnotations();
       })();
     </script>
     </body></html>`;

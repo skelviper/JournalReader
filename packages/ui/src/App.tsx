@@ -25,6 +25,7 @@ type ParseStats = {
   refsCount: number;
   figuresCount: number;
   tablesCount: number;
+  extCount: number;
   suppCount: number;
 };
 
@@ -46,6 +47,13 @@ type SelectionAction = {
   id: number;
   kind: "highlight";
   page: number;
+};
+
+type DocumentFindRequest = {
+  seq: number;
+  page: number;
+  query: string;
+  direction: 1 | -1;
 };
 
 type HighlightMenuState = {
@@ -115,10 +123,10 @@ type PageVisualMask = {
 
 const MIN_SCALE = 0.8;
 const MAX_SCALE = 2.8;
-const PINCH_BASE_GAIN = 0.00155;
-const PINCH_MIN_ABS_DELTA = 0.05;
-const PINCH_MAX_REL_STEP = 0.065;
-const PINCH_SMOOTH_ALPHA = 0.45;
+const PINCH_BASE_GAIN = 0.00142;
+const PINCH_MIN_ABS_DELTA = 0.04;
+const PINCH_MAX_REL_STEP = 0.045;
+const PINCH_SMOOTH_ALPHA = 0.34;
 const HIGHLIGHT_COLORS = [
   { label: "Yellow", value: "#fce588" },
   { label: "Green", value: "#b8f3b4" },
@@ -172,33 +180,34 @@ function defaultTranslationSettings(): TranslationSettings {
 }
 
 function loadTranslationSettings(): TranslationSettings {
+  const defaults = defaultTranslationSettings();
   if (typeof window === "undefined") {
-    return defaultTranslationSettings();
+    return defaults;
   }
   try {
     const raw = window.localStorage.getItem(TRANSLATION_SETTINGS_KEY);
     if (!raw) {
-      return defaultTranslationSettings();
+      return defaults;
     }
     const parsed = JSON.parse(raw) as Partial<TranslationSettings>;
     const provider = TRANSLATION_PROVIDERS.some((item) => item.value === parsed.provider)
       ? (parsed.provider as TranslateProvider)
-      : "google";
+      : defaults.provider;
     const sourceLang =
       TRANSLATION_LANGUAGES.some((item) => item.value === parsed.sourceLang) && parsed.sourceLang
         ? parsed.sourceLang
-        : "auto";
+        : defaults.sourceLang;
     const targetLang =
       TRANSLATION_LANGUAGES.some((item) => item.value === parsed.targetLang) && parsed.targetLang
         ? parsed.targetLang
-        : "en";
+        : defaults.targetLang;
     return {
       provider,
       sourceLang,
       targetLang,
     };
   } catch {
-    return defaultTranslationSettings();
+    return defaults;
   }
 }
 
@@ -1183,6 +1192,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   const pinchSmoothedDeltaRef = useRef(0);
   const pinchPointerRef = useRef({ x: 0, y: 0 });
   const selectionActionSeqRef = useRef(0);
+  const findRequestSeqRef = useRef(0);
+  const pageTextCacheRef = useRef<Map<number, string>>(new Map());
+  const lastFindQueryRef = useRef("");
   const [docId, setDocId] = useState<string | null>(null);
   const [docTitle, setDocTitle] = useState("No document loaded");
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
@@ -1202,6 +1214,10 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [focusedNoteId, setFocusedNoteId] = useState<string | null>(null);
   const [selectedAnnotationIds, setSelectedAnnotationIds] = useState<string[]>([]);
+  const [findQuery, setFindQuery] = useState("");
+  const [findMatches, setFindMatches] = useState<number[]>([]);
+  const [findCursor, setFindCursor] = useState(-1);
+  const [findRequest, setFindRequest] = useState<DocumentFindRequest | null>(null);
 
   useEffect(() => {
     scaleRef.current = scale;
@@ -1402,7 +1418,7 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       }
 
       const currentScale = scaleRef.current;
-      const adaptiveGain = Math.max(0.0012, Math.min(0.00185, PINCH_BASE_GAIN - (currentScale - 1.3) * 0.0001));
+      const adaptiveGain = Math.max(0.001, Math.min(0.00162, PINCH_BASE_GAIN - (currentScale - 1.2) * 0.00008));
       const zoomFactor = Math.exp(-smoothedDeltaY * adaptiveGain);
       const idealScale = currentScale * zoomFactor;
       const maxStep = Math.max(0.01, currentScale * PINCH_MAX_REL_STEP);
@@ -1519,6 +1535,14 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     setFocusedNoteId(null);
   }, [docId]);
 
+  useEffect(() => {
+    pageTextCacheRef.current.clear();
+    lastFindQueryRef.current = "";
+    setFindMatches([]);
+    setFindCursor(-1);
+    setFindQuery("");
+  }, [docId, pdfDoc]);
+
   async function openFigureFromResolved(resolved: { targetId: string | null; kind: string; label: string }): Promise<void> {
     if (!docId || !resolved.targetId) {
       return;
@@ -1629,16 +1653,29 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       for (const candidate of candidates) {
         const captionPage = Math.max(1, Math.min(pdfDoc.numPages, candidate.page));
         const looksLikePlaceholder = /\bsee\s+next\s+page\s+for\s+caption\b/i.test(candidate.caption);
+        let hasNearCaptionMatch = false;
 
         if (candidate.captionRect) {
           const near = await detectNearCaption(candidate, false);
           if (near?.mode === "component") {
-            const placeholderPenalty = looksLikePlaceholder ? -6 : 5;
-            await considerCandidate(candidate, captionPage, near, placeholderPenalty);
+            hasNearCaptionMatch = true;
+            const nearBias = looksLikePlaceholder ? -4 : 14;
+            await considerCandidate(candidate, captionPage, near, nearBias);
+          } else {
+            const nearFallback = await detectNearCaption(candidate, true);
+            if (nearFallback) {
+              hasNearCaptionMatch = true;
+              const fallbackBias = looksLikePlaceholder ? -6 : 7;
+              await considerCandidate(candidate, captionPage, nearFallback, fallbackBias);
+            }
           }
         }
 
-        const probeRadius = looksLikePlaceholder ? 3 : 2;
+        if (hasNearCaptionMatch && !looksLikePlaceholder) {
+          continue;
+        }
+
+        const probeRadius = looksLikePlaceholder ? 3 : 0;
         const probePages = new Set<number>([captionPage]);
         for (let step = 1; step <= probeRadius; step += 1) {
           if (captionPage - step >= 1) {
@@ -1947,12 +1984,108 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         setErrorText("Could not open recognized popup window. Please restart the app and try again.");
         return;
       }
-      const label = kind === "ref" ? "references" : kind;
+      const label =
+        kind === "ref"
+          ? "references"
+          : kind === "ext"
+            ? "extended data figures"
+            : kind;
       setStatusText(`Opened recognized ${label}`);
     } catch (error) {
       setStatusText("Failed to open recognized list");
       setErrorText(formatError(error));
     }
+  }
+
+  async function getPageSearchText(pageNumber: number): Promise<string> {
+    if (!pdfDoc) {
+      return "";
+    }
+    const cached = pageTextCacheRef.current.get(pageNumber);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const page = await pdfDoc.getPage(pageNumber);
+    const textContent = await page.getTextContent();
+    const text = textContent.items
+      .map((item) => ("str" in item ? String(item.str ?? "") : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    pageTextCacheRef.current.set(pageNumber, text);
+    return text;
+  }
+
+  async function buildFindMatches(query: string): Promise<number[]> {
+    if (!pdfDoc || !query) {
+      return [];
+    }
+    const out: number[] = [];
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+      const pageText = await getPageSearchText(pageNumber);
+      if (pageText.includes(query)) {
+        out.push(pageNumber);
+      }
+    }
+    return out;
+  }
+
+  async function runDocumentFind(direction: 1 | -1): Promise<void> {
+    if (!pdfDoc) {
+      return;
+    }
+    const query = findQuery.trim().toLowerCase();
+    if (!query) {
+      setStatusText("Enter text in search box");
+      return;
+    }
+
+    let matches = findMatches;
+    const queryChanged = lastFindQueryRef.current !== query;
+    if (queryChanged) {
+      matches = await buildFindMatches(query);
+      lastFindQueryRef.current = query;
+      setFindMatches(matches);
+      setFindCursor(-1);
+    }
+
+    if (matches.length === 0) {
+      setStatusText(`No match for "${findQuery.trim()}"`);
+      return;
+    }
+
+    let nextCursor = findCursor;
+    if (queryChanged || nextCursor < 0) {
+      if (direction > 0) {
+        const firstAtOrAfterActive = matches.findIndex((page) => page >= activePage);
+        nextCursor = firstAtOrAfterActive >= 0 ? firstAtOrAfterActive : 0;
+      } else {
+        const prior = [...matches].reverse().findIndex((page) => page <= activePage);
+        nextCursor = prior >= 0 ? matches.length - 1 - prior : matches.length - 1;
+      }
+    } else {
+      const len = matches.length;
+      nextCursor = (nextCursor + direction + len) % len;
+    }
+
+    const page = matches[nextCursor];
+    if (!page) {
+      return;
+    }
+    setFindCursor(nextCursor);
+    setActivePage(page);
+    const reader = readerRef.current;
+    const pageElement = reader?.querySelector<HTMLElement>(`.page-wrap[data-page="${page}"]`);
+    pageElement?.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+    findRequestSeqRef.current += 1;
+    setFindRequest({
+      seq: findRequestSeqRef.current,
+      page,
+      query,
+      direction,
+    });
+    setStatusText(`Find ${nextCursor + 1}/${matches.length} · page ${page}`);
   }
 
   async function createHighlight(pageNumber: number, rects: Rect[], selectedText?: string): Promise<void> {
@@ -2310,6 +2443,35 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
               <span>{Math.round(scale * 100)}%</span>
             </div>
           ) : null}
+
+          <div className="doc-search" title="Search in current document">
+            <input
+              type="search"
+              value={findQuery}
+              placeholder="Find in document"
+              onChange={(event) => {
+                setFindQuery(event.target.value);
+                setFindCursor(-1);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void runDocumentFind(event.shiftKey ? -1 : 1);
+                }
+              }}
+            />
+            <ToolButton title="Previous match" onClick={() => void runDocumentFind(-1)}>
+              <IconGlyph d="M15 6l-6 6 6 6" />
+            </ToolButton>
+            <ToolButton title="Next match" onClick={() => void runDocumentFind(1)}>
+              <IconGlyph d="M9 6l6 6-6 6" />
+            </ToolButton>
+            {findMatches.length > 0 ? (
+              <span className="doc-search-count">
+                {findCursor >= 0 ? `${findCursor + 1}/${findMatches.length}` : `0/${findMatches.length}`}
+              </span>
+            ) : null}
+          </div>
         </div>
 
         <div className="status">{statusText}</div>
@@ -2343,6 +2505,7 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
                 onHighlightContextMenu={openHighlightMenuAt}
                 onAnnotationUpdate={updateAnnotation}
                 onAnnotationDelete={deleteAnnotation}
+                findRequest={findRequest}
               />
             ))}
           </div>
@@ -2363,6 +2526,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
             </button>
             <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("table")}>
               table {stats.tablesCount}
+            </button>
+            <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("ext")}>
+              ext {stats.extCount}
             </button>
             <button type="button" className="recognized-chip" onClick={() => void openRecognizedPopup("supp")}>
               supp {stats.suppCount}
@@ -2550,6 +2716,7 @@ function PdfPageSurface({
   onHighlightContextMenu,
   onAnnotationUpdate,
   onAnnotationDelete,
+  findRequest,
 }: {
   pdfDoc: PDFDocumentProxy;
   scrollRootRef: RefObject<HTMLDivElement>;
@@ -2573,6 +2740,7 @@ function PdfPageSurface({
   onHighlightContextMenu: (annotation: AnnotationItem, x: number, y: number) => void;
   onAnnotationUpdate: (id: string, patch: Partial<AnnotationItem>) => Promise<void>;
   onAnnotationDelete: (id: string, label: string) => Promise<void>;
+  findRequest: DocumentFindRequest | null;
 }): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const textLayerRef = useRef<HTMLDivElement | null>(null);
@@ -2584,7 +2752,17 @@ function PdfPageSurface({
   const [manualBindDragState, setManualBindDragState] = useState<DragState>(null);
   const [marqueeState, setMarqueeState] = useState<MarqueeState>(null);
   const [noteMoveState, setNoteMoveState] = useState<NoteMoveState>(null);
+  const findMarkedSpanRef = useRef<HTMLSpanElement | null>(null);
   const shouldRender = isNearViewport;
+
+  function clearFindMarker(): void {
+    const prev = findMarkedSpanRef.current;
+    if (!prev) {
+      return;
+    }
+    prev.classList.remove("find-hit");
+    findMarkedSpanRef.current = null;
+  }
 
   useEffect(() => {
     const target = pageWrapRef.current;
@@ -2602,7 +2780,7 @@ function PdfPageSurface({
       },
       {
         root: scrollRootRef.current,
-        rootMargin: "1000px 0px 1000px 0px",
+        rootMargin: "700px 0px 700px 0px",
         threshold: 0.01,
       },
     );
@@ -2657,7 +2835,79 @@ function PdfPageSurface({
         // noop
       }
     };
-  }, [pdfDoc, pageNumber, scale, toolMode, shouldRender]);
+  }, [pdfDoc, pageNumber, scale, shouldRender]);
+
+  useEffect(() => {
+    if (!findRequest || findRequest.page !== pageNumber) {
+      clearFindMarker();
+      return;
+    }
+    if (!shouldRender) {
+      return;
+    }
+
+    let cancelled = false;
+    const maxAttempts = 14;
+
+    const applyFindJump = (attempt = 0): void => {
+      if (cancelled) {
+        return;
+      }
+      const textLayer = textLayerRef.current;
+      const root = scrollRootRef.current;
+      if (!textLayer || !root) {
+        return;
+      }
+      const query = findRequest.query.trim().toLowerCase();
+      if (!query) {
+        return;
+      }
+
+      const spans = Array.from(textLayer.querySelectorAll<HTMLSpanElement>(".text-span"));
+      if (spans.length === 0) {
+        if (attempt < maxAttempts) {
+          window.requestAnimationFrame(() => applyFindJump(attempt + 1));
+        }
+        return;
+      }
+
+      const hits = spans.filter((span) => (span.textContent ?? "").toLowerCase().includes(query));
+      if (hits.length === 0) {
+        if (attempt < maxAttempts) {
+          window.requestAnimationFrame(() => applyFindJump(attempt + 1));
+        }
+        return;
+      }
+
+      const target = findRequest.direction < 0 ? hits[hits.length - 1] : hits[0];
+      if (!target) {
+        return;
+      }
+      clearFindMarker();
+      target.classList.add("find-hit");
+      findMarkedSpanRef.current = target;
+
+      const rootRect = root.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const marginX = Math.max(24, rootRect.width * 0.34);
+      const marginY = Math.max(24, rootRect.height * 0.28);
+      const nextLeft = Math.max(0, root.scrollLeft + (targetRect.left - rootRect.left) - marginX);
+      const nextTop = Math.max(0, root.scrollTop + (targetRect.top - rootRect.top) - marginY);
+      root.scrollTo({ left: nextLeft, top: nextTop, behavior: "smooth" });
+    };
+
+    window.requestAnimationFrame(() => applyFindJump(0));
+    return () => {
+      cancelled = true;
+    };
+  }, [findRequest?.seq, findRequest?.page, findRequest?.query, findRequest?.direction, pageNumber, shouldRender, scrollRootRef]);
+
+  useEffect(
+    () => () => {
+      clearFindMarker();
+    },
+    [],
+  );
 
   async function renderPage(): Promise<void> {
     if (!canvasRef.current || !textLayerRef.current || !shouldRender) {
@@ -2686,9 +2936,13 @@ function PdfPageSurface({
     }
 
     const viewport = page.getViewport({ scale });
-    setPageSize({
-      width: Math.max(1, Math.floor(viewport.width / Math.max(0.01, scale))),
-      height: Math.max(1, Math.floor(viewport.height / Math.max(0.01, scale))),
+    const baseWidth = Math.max(1, Math.floor(viewport.width / Math.max(0.01, scale)));
+    const baseHeight = Math.max(1, Math.floor(viewport.height / Math.max(0.01, scale)));
+    setPageSize((prev) => {
+      if (prev && prev.width === baseWidth && prev.height === baseHeight) {
+        return prev;
+      }
+      return { width: baseWidth, height: baseHeight };
     });
     const canvas = canvasRef.current;
     const context = canvas.getContext("2d");
@@ -2696,7 +2950,7 @@ function PdfPageSurface({
       return;
     }
 
-    const outputScale = Math.max(1, Math.min(1.6, window.devicePixelRatio || 1));
+    const outputScale = Math.max(1, Math.min(1.45, window.devicePixelRatio || 1));
     canvas.style.width = `${Math.floor(viewport.width)}px`;
     canvas.style.height = `${Math.floor(viewport.height)}px`;
     canvas.width = Math.floor(viewport.width * outputScale);
@@ -2722,6 +2976,7 @@ function PdfPageSurface({
     }
 
     const textLayer = textLayerRef.current;
+    clearFindMarker();
     textLayer.innerHTML = "";
     textLayer.onclick = null;
     textLayer.style.width = `${Math.floor(viewport.width)}px`;

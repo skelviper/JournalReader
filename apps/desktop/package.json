@@ -1,7 +1,7 @@
 {
   "name": "@journal-reader/desktop",
   "productName": "Journal Reader",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "type": "module",
   "main": "dist/main/index.js",
@@ -20,6 +20,7 @@
     "pack:mac": "npm run generate:icon && npm run build && electron-builder --mac --dir --publish never",
     "dist:mac": "npm run generate:icon && npm run build && electron-builder --mac zip --publish never",
     "dist:mac:dmg": "npm run generate:icon && npm run build && electron-builder --mac dmg --publish never",
+    "dist:win:exe": "npm run build && electron-builder --win nsis --x64 --publish never",
     "dist:mac:arm64": "npm run generate:icon && npm run build && electron-builder --mac dmg zip --arm64 --publish never",
     "dist:mac:x64": "npm run generate:icon && npm run build && electron-builder --mac dmg zip --x64 --publish never",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.preload.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
@@ -62,14 +63,25 @@
         }
       ],
       "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
     }
   },
   "dependencies": {
-    "@journal-reader/parser": "0.0.2",
-    "@journal-reader/pdf-core": "0.0.2",
-    "@journal-reader/storage": "0.0.2",
-    "@journal-reader/types": "0.0.2",
-    "@journal-reader/ui": "0.0.2",
+    "@journal-reader/parser": "0.0.3",
+    "@journal-reader/pdf-core": "0.0.3",
+    "@journal-reader/storage": "0.0.3",
+    "@journal-reader/types": "0.0.3",
+    "@journal-reader/ui": "0.0.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

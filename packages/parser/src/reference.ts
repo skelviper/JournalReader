@@ -341,17 +341,22 @@ function hasDenseReferenceStartsAround(lines: LineEntry[], anchorIndex: number):
   return unique.length >= 2 && maxIndex >= 2;
 }
 
-function findReferencesStart(lines: LineEntry[]): number {
+function findReferencesStarts(lines: LineEntry[]): number[] {
+  const starts = new Set<number>();
   const explicitHeaders = lines
     .map((line, idx) => ({ line, idx }))
     .filter((item) => REFERENCES_HEADER_PATTERN.test(normalizeEntryLeadNoise(item.line.text)))
     .map((item) => item.idx);
   for (const idx of explicitHeaders) {
     if (hasDenseReferenceStartsAround(lines, idx)) {
-      return idx;
+      starts.add(Math.max(0, idx));
     }
   }
-  return -1;
+  const guessed = guessReferencesStartsByCandidates(lines);
+  for (const idx of guessed) {
+    starts.add(Math.max(0, idx));
+  }
+  return [...starts].sort((a, b) => a - b);
 }
 
 function parseEntryStart(text: string): { index: number; body: string } | null {
@@ -501,6 +506,182 @@ function parseEntryStartsInLine(text: string): Array<{ index: number; body: stri
   return [];
 }
 
+function parseIsolatedReferenceIndexToken(text: string): number | null {
+  const normalized = normalizeSpaces(text).replace(/[，,;:]+$/, "");
+  const bracket = normalized.match(/^\[(\d{1,4})\]$/);
+  if (bracket?.[1]) {
+    const value = Number(bracket[1]);
+    if (Number.isFinite(value) && value >= 1 && value <= 500) {
+      return value;
+    }
+    return null;
+  }
+  const plain = normalized.match(/^(\d{1,4})[.)]$/);
+  if (plain?.[1]) {
+    const value = Number(plain[1]);
+    if (Number.isFinite(value) && value >= 1 && value <= 500) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function isLikelyReferenceLeadText(text: string): boolean {
+  const normalized = normalizeEntryLeadNoise(text);
+  if (normalized.length < 12) {
+    return false;
+  }
+  if (isPlausibleReferenceSeed(normalized)) {
+    return true;
+  }
+  if (/^[A-Z][A-Za-z'’\-]{1,40},\s*[A-Z]/.test(normalized)) {
+    return true;
+  }
+  if (/^[A-Z][A-Za-z'’\-]{1,40}\s+(?:and|&)\s+[A-Z][A-Za-z'’\-]{1,40}/.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function extractNumberedEntriesFromSpans(spans: ParsedTextSpan[], docId: string): ReferenceEntry[] {
+  if (spans.length === 0) {
+    return [];
+  }
+
+  const byPage = new Map<number, ParsedTextSpan[]>();
+  for (const span of spans) {
+    const list = byPage.get(span.page) ?? [];
+    list.push(span);
+    byPage.set(span.page, list);
+  }
+
+  const extracted: ReferenceEntry[] = [];
+
+  for (const [page, pageSpans] of byPage.entries()) {
+    if (pageSpans.length < 12) {
+      continue;
+    }
+
+    const candidates: Array<{ index: number; x: number; y: number; body: string }> = [];
+    for (const marker of pageSpans) {
+      const index = parseIsolatedReferenceIndexToken(marker.text);
+      if (!index) {
+        continue;
+      }
+      const markerRight = marker.bbox.x + marker.bbox.w;
+      const markerMidY = marker.bbox.y + marker.bbox.h / 2;
+      const maxDy = Math.max(2.8, Math.min(8, marker.bbox.h * 1.25 + 1.5));
+
+      let bestBody = "";
+      let bestScore = Number.POSITIVE_INFINITY;
+      for (const bodySpan of pageSpans) {
+        if (bodySpan === marker) {
+          continue;
+        }
+        if (bodySpan.bbox.x <= markerRight + 0.8) {
+          continue;
+        }
+        const dx = bodySpan.bbox.x - markerRight;
+        if (dx > 96) {
+          continue;
+        }
+        const bodyMidY = bodySpan.bbox.y + bodySpan.bbox.h / 2;
+        const dy = Math.abs(bodyMidY - markerMidY);
+        if (dy > maxDy) {
+          continue;
+        }
+        const bodyText = normalizeEntryLeadNoise(bodySpan.text);
+        if (!isLikelyReferenceLeadText(bodyText)) {
+          continue;
+        }
+        const score = dx + dy * 8;
+        if (score < bestScore) {
+          bestScore = score;
+          bestBody = bodyText;
+        }
+      }
+
+      if (!bestBody) {
+        continue;
+      }
+      candidates.push({
+        index,
+        x: marker.bbox.x,
+        y: marker.bbox.y,
+        body: bestBody,
+      });
+    }
+
+    if (candidates.length < 4) {
+      continue;
+    }
+
+    const byBucket = new Map<number, Array<{ index: number; x: number; y: number; body: string }>>();
+    for (const item of candidates) {
+      const bucket = Math.round(item.x / 24);
+      const list = byBucket.get(bucket) ?? [];
+      list.push(item);
+      byBucket.set(bucket, list);
+    }
+    const bucketEntries = [...byBucket.entries()].sort((a, b) => b[1].length - a[1].length);
+    const topCount = bucketEntries[0]?.[1].length ?? 0;
+
+    const accepted: Array<{ index: number; x: number; y: number; body: string }> = [];
+    for (const [bucket, items] of bucketEntries.slice(0, 3)) {
+      if (items.length < 4) {
+        continue;
+      }
+      if (items.length < Math.max(4, Math.floor(topCount * 0.45))) {
+        continue;
+      }
+
+      const centerX = bucket * 24;
+      const clustered = candidates.filter((item) => Math.abs(item.x - centerX) <= 14);
+      if (clustered.length < 4) {
+        continue;
+      }
+
+      const ordered = [...clustered].sort((a, b) => b.y - a.y);
+      let increasing = 0;
+      for (let i = 0; i < ordered.length - 1; i += 1) {
+        const current = ordered[i];
+        const next = ordered[i + 1];
+        if ((current?.index ?? 0) < (next?.index ?? 0)) {
+          increasing += 1;
+        }
+      }
+      const monotonicScore = ordered.length > 1 ? increasing / (ordered.length - 1) : 1;
+      if (monotonicScore < 0.55 && clustered.length < 10) {
+        continue;
+      }
+
+      accepted.push(...clustered);
+    }
+
+    if (accepted.length === 0) {
+      const dominant = bucketEntries[0]?.[1] ?? [];
+      if (dominant.length >= 8) {
+        accepted.push(...dominant);
+      }
+    }
+
+    if (accepted.length === 0) {
+      continue;
+    }
+
+    for (const item of accepted) {
+      extracted.push({
+        docId,
+        index: item.index,
+        text: item.body,
+        page,
+      });
+    }
+  }
+
+  return dedupeReferenceEntries(extracted);
+}
+
 function densePrefixLength(indices: number[]): number {
   if (indices.length === 0) {
     return 0;
@@ -519,9 +700,9 @@ function densePrefixLength(indices: number[]): number {
   return prefix;
 }
 
-function guessReferencesStartByCandidates(lines: LineEntry[]): number {
+function guessReferencesStartsByCandidates(lines: LineEntry[]): number[] {
   if (lines.length === 0) {
-    return -1;
+    return [];
   }
 
   const candidates = lines
@@ -529,40 +710,56 @@ function guessReferencesStartByCandidates(lines: LineEntry[]): number {
     .filter((item) => item.starts.length > 0);
 
   if (candidates.length === 0) {
-    return -1;
+    return [];
   }
 
-  const byPage = new Map<number, Array<{ idx: number; starts: Array<{ index: number; body: string }> }>>();
-  for (const item of candidates) {
-    const list = byPage.get(item.line.page) ?? [];
-    list.push({ idx: item.idx, starts: item.starts });
-    byPage.set(item.line.page, list);
-  }
-
-  const pages = [...byPage.keys()].sort((a, b) => a - b);
-  for (const page of pages) {
-    const windowItems = candidates.filter((item) => item.line.page >= page && item.line.page <= page + 2);
+  const pages = [...new Set(candidates.map((item) => item.line.page))].sort((a, b) => a - b);
+  const densePages = pages.filter((page) => {
+    const windowItems = candidates.filter((item) => item.line.page >= page && item.line.page <= page + 1);
     const count = windowItems.reduce((acc, item) => acc + item.starts.length, 0);
     const indices = windowItems.flatMap((item) => item.starts.map((entry) => entry.index));
     const uniqueCount = new Set(indices).size;
     const maxIndex = indices.length > 0 ? Math.max(...indices) : 0;
-    if (count >= 8 && uniqueCount >= 6 && maxIndex >= 10) {
-      const firstOnPage = windowItems
-        .filter((item) => item.line.page === page)
-        .sort((a, b) => a.idx - b.idx)[0];
+    return count >= 6 && uniqueCount >= 4 && maxIndex >= 6;
+  });
+
+  const starts = new Set<number>();
+  if (densePages.length > 0) {
+    const clusters: number[][] = [];
+    for (const page of densePages) {
+      const current = clusters[clusters.length - 1];
+      if (!current) {
+        clusters.push([page]);
+        continue;
+      }
+      const prevPage = current[current.length - 1] ?? page;
+      if (page - prevPage <= 3) {
+        current.push(page);
+        continue;
+      }
+      clusters.push([page]);
+    }
+    for (const cluster of clusters) {
+      const firstPage = cluster[0];
+      if (firstPage === undefined) {
+        continue;
+      }
+      const firstOnPage = candidates.filter((item) => item.line.page === firstPage).sort((a, b) => a.idx - b.idx)[0];
       if (firstOnPage) {
-        return Math.max(0, firstOnPage.idx - 1);
+        starts.add(Math.max(0, firstOnPage.idx - 1));
       }
     }
   }
 
-  const startAtOne = candidates
-    .find((item) => item.starts.some((entry) => entry.index === 1));
+  const startAtOne = candidates.find((item) => item.starts.some((entry) => entry.index === 1));
   if (startAtOne) {
-    return Math.max(0, startAtOne.idx - 1);
+    starts.add(Math.max(0, startAtOne.idx - 1));
+  }
+  if (starts.size === 0 && candidates[0]) {
+    starts.add(Math.max(0, (candidates[0]?.idx ?? 0) - 1));
   }
 
-  return Math.max(0, candidates[0]?.idx ?? 0);
+  return [...starts].sort((a, b) => a - b);
 }
 
 function isLikelyEntryContinuation(text: string): boolean {
@@ -604,6 +801,7 @@ function isPlausibleReferenceSeed(body: string): boolean {
   const hasYear = /(?:19|20)\d{2}[a-z]?/.test(text);
   const hasEtAl = /\bet\s+al\.?/i.test(text);
   const hasDoi = /\bdoi[:\s]/i.test(text) || /https?:\/\/doi\.org\//i.test(text);
+  const hasInitialLead = /^[A-Z]\.\s*[A-Z][A-Za-z'’\-]{1,40},?/.test(text);
   const startsWithParticle = /^(?:de|van|von|da|di|del|la|le|du)\s+[A-Z][A-Za-z'’\-]{1,40}\b/.test(text);
   const hasAuthorLead =
     /^[A-Z][A-Za-z'’\-]{1,40}(?:,\s*[A-Z][A-Za-z.\-\s]{0,20})?/.test(text) ||
@@ -614,6 +812,7 @@ function isPlausibleReferenceSeed(body: string): boolean {
 
   let score = 0;
   if (hasAuthorLead) score += 2;
+  if (hasInitialLead) score += 2;
   if (hasYear) score += 2;
   if (hasEtAl) score += 2;
   if (hasDoi) score += 2;
@@ -670,6 +869,10 @@ function clusterReferenceBands(lines: LineEntry[]): ReferenceColumnBand[] {
 
   if (bands.length <= 1) {
     return bands;
+  }
+  const totalCount = bands.reduce((sum, band) => sum + band.count, 0);
+  if (totalCount <= 14) {
+    return bands.slice(0, 2).sort((a, b) => a.center - b.center);
   }
 
   const first = bands[0];
@@ -768,12 +971,38 @@ function extractReferenceEntries(lines: LineEntry[], docId: string, startIndex: 
     }
     const lineBands = resolveBandsForPage(line.page, bandsByPage);
     if (lineBands.length > 0 && !lineInBands(line, lineBands)) {
-      continue;
+      const detachedNumericOnly = starts.length === 1 && normalizeSpaces(starts[0]?.body ?? "").length <= 2;
+      if (!detachedNumericOnly) {
+        continue;
+      }
+      const nextLine = scoped[i + 1];
+      if (!nextLine || parseEntryStartsInLine(nextLine.text).length > 0 || !isLikelyEntryContinuation(nextLine.text)) {
+        continue;
+      }
+      const nextBands = resolveBandsForPage(nextLine.page, bandsByPage);
+      if (nextBands.length > 0 && !lineInBands(nextLine, nextBands)) {
+        continue;
+      }
     }
 
     const acceptedStarts = starts.filter((start) => {
       if (isPlausibleReferenceSeed(start.body)) {
         return true;
+      }
+      if (starts.length === 1 && normalizeSpaces(start.body).length <= 2) {
+        const nextLine = scoped[i + 1];
+        const next2Line = scoped[i + 2];
+        const firstContinuation =
+          nextLine && parseEntryStartsInLine(nextLine.text).length === 0 && isLikelyEntryContinuation(nextLine.text)
+            ? normalizeEntryLeadNoise(nextLine.text)
+            : "";
+        const secondContinuation =
+          next2Line && parseEntryStartsInLine(next2Line.text).length === 0 && isLikelyEntryContinuation(next2Line.text)
+            ? normalizeEntryLeadNoise(next2Line.text)
+            : "";
+        if (isPlausibleReferenceSeed(firstContinuation) || isPlausibleReferenceSeed(`${firstContinuation} ${secondContinuation}`)) {
+          return true;
+        }
       }
       // Tolerate short stretches of weakly formatted entries when numbering is contiguous.
       if (allowWeakStarts && starts.length === 1) {
@@ -1038,6 +1267,25 @@ function extractAuthorYearEntries(lines: LineEntry[], docId: string, startIndex:
 
   flush();
   return out;
+}
+
+function dedupeReferenceEntries(entries: ReferenceEntry[]): ReferenceEntry[] {
+  const byIndex = new Map<number, ReferenceEntry>();
+  for (const entry of entries) {
+    const current = byIndex.get(entry.index);
+    if (!current) {
+      byIndex.set(entry.index, entry);
+      continue;
+    }
+    if (entry.text.length > current.text.length) {
+      byIndex.set(entry.index, entry);
+      continue;
+    }
+    if (entry.text.length === current.text.length && entry.page < current.page) {
+      byIndex.set(entry.index, entry);
+    }
+  }
+  return [...byIndex.values()].sort((a, b) => a.index - b.index);
 }
 
 function isNumberedEntriesUnreliable(entries: ReferenceEntry[]): boolean {
@@ -1362,21 +1610,69 @@ function extractInTextMarkers(
   return dedupeMarkers(markers);
 }
 
+export function inferReferenceCount(entries: ReferenceEntry[], markers: InTextReferenceMarker[] = []): number {
+  const indices = [
+    ...entries.map((entry) => entry.index),
+    ...markers.flatMap((marker) => marker.indices ?? []),
+  ]
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .map((value) => Math.floor(value));
+  if (indices.length === 0) {
+    return 0;
+  }
+
+  const sorted = [...new Set(indices)].sort((a, b) => a - b);
+  let inferred = sorted[sorted.length - 1] ?? sorted.length;
+
+  for (let i = 0; i < sorted.length - 1; i += 1) {
+    const current = sorted[i] ?? 0;
+    const next = sorted[i + 1] ?? current;
+    const gap = next - current;
+    const prefixSize = i + 1;
+    const tailSize = sorted.length - prefixSize;
+    const largeGap = gap >= 8;
+    const stablePrefix = current >= 15;
+    const tailLooksLikeOutliers = tailSize <= Math.max(4, Math.floor(prefixSize * 0.2));
+    if (largeGap && stablePrefix && tailLooksLikeOutliers) {
+      inferred = current;
+      break;
+    }
+  }
+
+  return inferred;
+}
+
 export function extractReferenceData(spans: ParsedTextSpan[], docId: string): ReferenceParseResult {
   const lines = buildLines(spans);
-  const referencesStart = (() => {
-    const explicit = findReferencesStart(lines);
-    if (explicit >= 0) {
-      return explicit;
-    }
-    return guessReferencesStartByCandidates(lines);
-  })();
-  const numberedEntries = extractReferenceEntries(lines, docId, referencesStart);
-  const authorYearEntries = extractAuthorYearEntries(lines, docId, referencesStart);
-  const entries =
+  const startCandidates = findReferencesStarts(lines);
+  const referencesStart = startCandidates[0] ?? -1;
+  const numberedEntries = dedupeReferenceEntries(
+    (startCandidates.length > 0 ? startCandidates : [referencesStart]).flatMap((start) => extractReferenceEntries(lines, docId, start)),
+  );
+  const authorYearEntries = dedupeReferenceEntries(
+    (startCandidates.length > 0 ? startCandidates : [referencesStart]).flatMap((start) => extractAuthorYearEntries(lines, docId, start)),
+  );
+  let entries =
     authorYearEntries.length >= 8 && (isNumberedEntriesUnreliable(numberedEntries) || authorYearEntries.length > numberedEntries.length * 1.25)
       ? authorYearEntries
       : numberedEntries;
+
+  const spanNumberedEntries = extractNumberedEntriesFromSpans(spans, docId);
+  if (spanNumberedEntries.length > 0) {
+    const merged = dedupeReferenceEntries([...entries, ...spanNumberedEntries]);
+    const basePrefix = densePrefixLength(entries.map((item) => item.index));
+    const mergedPrefix = densePrefixLength(merged.map((item) => item.index));
+    const baseInferred = inferReferenceCount(entries);
+    const mergedInferred = inferReferenceCount(merged);
+    const shouldAdoptSpanFallback =
+      (mergedPrefix >= Math.max(12, basePrefix + 6) && mergedInferred >= baseInferred) ||
+      (basePrefix < 8 && mergedPrefix >= 20) ||
+      (entries.length < 24 && merged.length >= entries.length + 10 && mergedInferred >= baseInferred + 8);
+    if (shouldAdoptSpanFallback) {
+      entries = merged;
+    }
+  }
+
   const authorYearIndex = buildAuthorYearEntryIndex(entries);
   const markers = filterMarkersByEntryIndex(extractInTextMarkers(lines, docId, referencesStart, authorYearIndex), entries);
   return { markers, entries };

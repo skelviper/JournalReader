@@ -61,9 +61,13 @@ function applyRuntimeDockIcon(): void {
 
 type VersionTuple = [number, number, number];
 
+function normalizeVersionTag(raw: string): string {
+  return raw.trim().replace(/^v/i, "");
+}
+
 function parseSemver(raw: string): VersionTuple | null {
-  const normalized = raw.trim().replace(/^v/i, "");
-  const match = normalized.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  const normalized = normalizeVersionTag(raw);
+  const match = normalized.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
   if (!match) {
     return null;
   }
@@ -91,7 +95,12 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-async function fetchLatestGithubVersion(): Promise<string | null> {
+type LatestReleaseInfo = {
+  version: string;
+  url: string;
+};
+
+async function fetchLatestGithubReleaseInfo(): Promise<LatestReleaseInfo | null> {
   const headers = {
     Accept: "application/vnd.github+json",
     "User-Agent": "JournalReaderApp",
@@ -100,14 +109,17 @@ async function fetchLatestGithubVersion(): Promise<string | null> {
   try {
     const releaseRes = await fetch(GITHUB_API_RELEASES_LATEST, { headers });
     if (releaseRes.ok) {
-      const data = (await releaseRes.json()) as { tag_name?: string };
+      const data = (await releaseRes.json()) as { tag_name?: string; html_url?: string };
       const tag = data?.tag_name?.trim();
       if (tag && parseSemver(tag)) {
-        return tag.replace(/^v/i, "");
+        return {
+          version: normalizeVersionTag(tag),
+          url: data?.html_url?.trim() || `${GITHUB_REPO_URL}/releases/latest`,
+        };
       }
     }
   } catch {
-    // ignore and try tag fallback
+    // ignore and try tags fallback
   }
 
   try {
@@ -120,7 +132,11 @@ async function fetchLatestGithubVersion(): Promise<string | null> {
     if (!first || !parseSemver(first)) {
       return null;
     }
-    return first.replace(/^v/i, "");
+    const clean = normalizeVersionTag(first);
+    return {
+      version: clean,
+      url: `${GITHUB_REPO_URL}/releases/tag/v${clean}`,
+    };
   } catch {
     return null;
   }
@@ -128,7 +144,7 @@ async function fetchLatestGithubVersion(): Promise<string | null> {
 
 async function checkForUpdates(): Promise<void> {
   const parent = BrowserWindow.getFocusedWindow() ?? mainWindow;
-  const currentVersion = app.getVersion();
+  const currentVersion = normalizeVersionTag(app.getVersion());
   const showInfo = async (options: Electron.MessageBoxOptions): Promise<Electron.MessageBoxReturnValue> => {
     if (parent) {
       return dialog.showMessageBox(parent, options);
@@ -137,8 +153,8 @@ async function checkForUpdates(): Promise<void> {
   };
 
   try {
-    const latestVersion = await fetchLatestGithubVersion();
-    if (!latestVersion) {
+    const latest = await fetchLatestGithubReleaseInfo();
+    if (!latest) {
       await showInfo({
         type: "info",
         title: "Check for Updates",
@@ -148,23 +164,7 @@ async function checkForUpdates(): Promise<void> {
       return;
     }
 
-    const cmp = compareSemver(currentVersion, latestVersion);
-    if (cmp < 0) {
-      const result = await showInfo({
-        type: "info",
-        buttons: ["Open GitHub Releases", "Later"],
-        defaultId: 0,
-        cancelId: 1,
-        title: "Update Available",
-        message: `A newer version is available: ${latestVersion}`,
-        detail: `Current version: ${currentVersion}`,
-      });
-      if (result.response === 0) {
-        await shell.openExternal(`${GITHUB_REPO_URL}/releases`);
-      }
-      return;
-    }
-
+    const cmp = compareSemver(currentVersion, latest.version);
     if (cmp === 0) {
       await showInfo({
         type: "info",
@@ -176,9 +176,14 @@ async function checkForUpdates(): Promise<void> {
 
     await showInfo({
       type: "info",
-      title: "Version Check",
-      message: `You are running a newer build (${currentVersion}) than GitHub latest (${latestVersion}).`,
+      buttons: ["Open Release Page"],
+      defaultId: 0,
+      cancelId: 0,
+      title: "Version Mismatch",
+      message: `Current: ${currentVersion}\nLatest release: ${latest.version}`,
+      detail: "Opening GitHub release page.",
     });
+    await shell.openExternal(latest.url);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     await showInfo({
@@ -315,7 +320,7 @@ app
     app.setAboutPanelOptions({
       applicationName: APP_DISPLAY_NAME,
       applicationVersion: app.getVersion(),
-      copyright: APP_AUTHOR_CREDITS,
+      copyright: "© skelviper",
       credits: APP_AUTHOR_CREDITS,
       website: GITHUB_REPO_URL,
     });

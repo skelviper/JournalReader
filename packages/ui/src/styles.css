@@ -173,6 +173,34 @@ select {
   flex-shrink: 0;
 }
 
+.doc-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid var(--chrome-border);
+  border-radius: 12px;
+  background: #eceff4;
+}
+
+.doc-search input {
+  width: clamp(170px, 22vw, 280px);
+  height: 30px;
+  border: 1px solid #bcc6d4;
+  border-radius: 8px;
+  background: #fff;
+  color: #203044;
+  padding: 0 10px;
+}
+
+.doc-search-count {
+  min-width: 50px;
+  text-align: right;
+  color: #55667b;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .status {
   grid-area: status;
   margin-left: 0;
@@ -237,6 +265,11 @@ select {
   white-space: pre;
   transform-origin: 0% 0%;
   cursor: text;
+}
+
+.text-span.find-hit {
+  background: rgba(255, 212, 76, 0.6);
+  border-radius: 2px;
 }
 
 .annotation-layer {

@@ -2,8 +2,8 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { extractTextSpans } from "@journal-reader/pdf-core";
-import { extractCaptions, extractCitations, extractReferenceData, mapCitationsToTargets } from "@journal-reader/parser";
-import type { CitationRef, ParsedCaption, ReferenceEntry } from "@journal-reader/types";
+import { extractCaptions, extractCitations, extractReferenceData, inferReferenceCount, mapCitationsToTargets } from "@journal-reader/parser";
+import type { CitationRef, ParsedCaption } from "@journal-reader/types";
 
 type ExpectedCounts = {
   main?: number;
@@ -97,33 +97,6 @@ function densePrefixCount(values: Iterable<number>): number {
   return prefix;
 }
 
-function inferReferenceCount(entries: ReferenceEntry[]): number {
-  const indices = [...new Set(entries.map((item) => item.index))]
-    .filter((value) => Number.isFinite(value) && value > 0)
-    .sort((a, b) => a - b);
-  if (indices.length === 0) {
-    return 0;
-  }
-
-  let prefixEnd = indices[indices.length - 1] ?? indices.length;
-  for (let i = 0; i < indices.length - 1; i += 1) {
-    const current = indices[i] ?? 0;
-    const next = indices[i + 1] ?? current;
-    const gap = next - current;
-    const prefixSize = i + 1;
-    const tailSize = indices.length - prefixSize;
-    const largeGap = gap >= 8;
-    const stablePrefix = current >= 15;
-    const tailLooksLikeOutliers = tailSize <= Math.max(4, Math.floor(prefixSize * 0.2));
-    if (largeGap && stablePrefix && tailLooksLikeOutliers) {
-      prefixEnd = current;
-      break;
-    }
-  }
-
-  return prefixEnd;
-}
-
 function calcActualCounts(
   captions: ReturnType<typeof extractCaptions>,
   citations: CitationRef[],
@@ -144,7 +117,7 @@ function calcActualCounts(
   );
   const sup = Math.max(supFromCaptionDense, supFromCitationDense);
 
-  const ref = inferReferenceCount(references.entries);
+  const ref = inferReferenceCount(references.entries, references.markers);
 
   return {
     main,

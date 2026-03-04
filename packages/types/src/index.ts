@@ -65,6 +65,7 @@ export type ParseDocResponse = {
   refsCount: number;
   figuresCount: number;
   tablesCount: number;
+  extCount: number;
   suppCount: number;
 };
 
@@ -156,7 +157,7 @@ export type TranslatePopupPayload = {
   detectedSourceLang?: string;
 };
 
-export type RecognizedPopupKind = "ref" | "fig" | "table" | "supp";
+export type RecognizedPopupKind = "ref" | "fig" | "table" | "ext" | "supp";
 
 export type CaptionSyncHighlightsPayload = {
   docId: string;
