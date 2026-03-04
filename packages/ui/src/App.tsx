@@ -430,6 +430,7 @@ function extractReferenceIndices(text: string): number[] {
 
 function parseCitationSelection(text: string): { kind: TargetKind; label: string } | null {
   const normalized = text.replace(/\s+/g, " ").trim();
+  const hasSupplementaryCue = /\b(?:extended\s+data|supplementary|supp\.)\b/i.test(normalized);
   const match = normalized.match(
     /(Supplementary\s+(?:Figure|Fig\.?|Table)|Extended\s+Data\s+(?:Figure|Fig\.?|Table)|Figure|Fig\.?|Table)\.?\s*(S?\d+)\s*([A-Za-z]?)/i,
   );
@@ -440,13 +441,18 @@ function parseCitationSelection(text: string): { kind: TargetKind; label: string
   const base = (match[2] ?? "").trim().toUpperCase();
   const suffix = (match[3] ?? "").trim().toUpperCase();
   const label = `${base}${suffix}`;
-  const kind: TargetKind = prefix.includes("table")
+  let kind: TargetKind = prefix.includes("table")
     ? prefix.includes("supplementary") || prefix.includes("extended data") || label.startsWith("S")
       ? "supplementary"
       : "table"
     : prefix.includes("supplementary") || prefix.includes("extended data") || label.startsWith("S")
       ? "supplementary"
       : "figure";
+  // Selection text can cross line breaks and punctuation, causing prefix to be parsed as plain "Fig.".
+  // If the selected snippet still contains "Extended Data"/"Supplementary", force supplementary mapping first.
+  if (kind !== "supplementary" && hasSupplementaryCue) {
+    kind = "supplementary";
+  }
   return { kind, label };
 }
 
@@ -1928,6 +1934,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       setErrorText("");
       const parsed = parseCitationSelection(selectionMenu.text);
       const fallbackLabel = extractAnyFigureLikeLabel(selectionMenu.text);
+      const normalizedSelection = selectionMenu.text.replace(/\s+/g, " ").trim();
+      const hasSupplementaryCue = /\b(?:extended\s+data|supplementary|supp\.)\b/i.test(normalizedSelection);
+      const hasTableCue = /\btable\b/i.test(normalizedSelection);
 
       const attempts: Array<{ kind: TargetKind; label: string }> = [];
       if (parsed) {
@@ -1936,9 +1945,17 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       if (fallbackLabel) {
         const already = attempts.some((item) => item.label === fallbackLabel);
         if (!already) {
-          attempts.push({ kind: "figure", label: fallbackLabel });
-          attempts.push({ kind: "table", label: fallbackLabel });
-          attempts.push({ kind: "supplementary", label: fallbackLabel });
+          if (hasSupplementaryCue) {
+            attempts.push({ kind: "supplementary", label: fallbackLabel });
+          } else if (hasTableCue) {
+            attempts.push({ kind: "table", label: fallbackLabel });
+            attempts.push({ kind: "figure", label: fallbackLabel });
+            attempts.push({ kind: "supplementary", label: fallbackLabel });
+          } else {
+            attempts.push({ kind: "figure", label: fallbackLabel });
+            attempts.push({ kind: "table", label: fallbackLabel });
+            attempts.push({ kind: "supplementary", label: fallbackLabel });
+          }
         }
       }
 
