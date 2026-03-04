@@ -430,7 +430,7 @@ function extractReferenceIndices(text: string): number[] {
 
 function parseCitationSelection(text: string): { kind: TargetKind; label: string } | null {
   const normalized = text.replace(/\s+/g, " ").trim();
-  const hasSupplementaryCue = /\b(?:extended\s+data|supplementary|supp\.)\b/i.test(normalized);
+  const hasSupplementaryCue = hasSupplementaryCueInSelection(normalized);
   const match = normalized.match(
     /(Supplementary\s+(?:Figure|Fig\.?|Table)|Extended\s+Data\s+(?:Figure|Fig\.?|Table)|Figure|Fig\.?|Table)\.?\s*(S?\d+)\s*([A-Za-z]?)/i,
   );
@@ -454,6 +454,21 @@ function parseCitationSelection(text: string): { kind: TargetKind; label: string
     kind = "supplementary";
   }
   return { kind, label };
+}
+
+function hasSupplementaryCueInSelection(text: string): boolean {
+  const normalized = text
+    .replace(/\u00ad/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return /(extended[\s-]*data|supp(?:lementary)?)/i.test(normalized);
+}
+
+function citationBaseLabel(label: string): string {
+  const normalized = label.trim().toUpperCase();
+  const match = normalized.match(/^(S?\d+)/);
+  return match ? match[1] : normalized;
 }
 
 function extractAnyFigureLikeLabel(text: string): string | null {
@@ -1935,27 +1950,52 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       const parsed = parseCitationSelection(selectionMenu.text);
       const fallbackLabel = extractAnyFigureLikeLabel(selectionMenu.text);
       const normalizedSelection = selectionMenu.text.replace(/\s+/g, " ").trim();
-      const hasSupplementaryCue = /\b(?:extended\s+data|supplementary|supp\.)\b/i.test(normalizedSelection);
+      const hasSupplementaryCue = hasSupplementaryCueInSelection(normalizedSelection);
       const hasTableCue = /\btable\b/i.test(normalizedSelection);
 
       const attempts: Array<{ kind: TargetKind; label: string }> = [];
+      const seenAttempts = new Set<string>();
+      const pushAttempt = (kind: TargetKind, rawLabel: string): void => {
+        const label = rawLabel.trim().toUpperCase();
+        if (!label) {
+          return;
+        }
+        const key = `${kind}:${label}`;
+        if (seenAttempts.has(key)) {
+          return;
+        }
+        seenAttempts.add(key);
+        attempts.push({ kind, label });
+      };
       if (parsed) {
-        attempts.push(parsed);
+        const primaryKind: TargetKind = hasSupplementaryCue ? "supplementary" : parsed.kind;
+        pushAttempt(primaryKind, parsed.label);
+        const parsedBase = citationBaseLabel(parsed.label);
+        if (parsedBase !== parsed.label.toUpperCase()) {
+          pushAttempt(primaryKind, parsedBase);
+        }
       }
       if (fallbackLabel) {
-        const already = attempts.some((item) => item.label === fallbackLabel);
-        if (!already) {
-          if (hasSupplementaryCue) {
-            attempts.push({ kind: "supplementary", label: fallbackLabel });
-          } else if (hasTableCue) {
-            attempts.push({ kind: "table", label: fallbackLabel });
-            attempts.push({ kind: "figure", label: fallbackLabel });
-            attempts.push({ kind: "supplementary", label: fallbackLabel });
-          } else {
-            attempts.push({ kind: "figure", label: fallbackLabel });
-            attempts.push({ kind: "table", label: fallbackLabel });
-            attempts.push({ kind: "supplementary", label: fallbackLabel });
+        const fallbackBase = citationBaseLabel(fallbackLabel);
+        if (hasSupplementaryCue) {
+          pushAttempt("supplementary", fallbackLabel);
+          if (fallbackBase !== fallbackLabel.toUpperCase()) {
+            pushAttempt("supplementary", fallbackBase);
           }
+        } else if (hasTableCue) {
+          pushAttempt("table", fallbackLabel);
+          if (fallbackBase !== fallbackLabel.toUpperCase()) {
+            pushAttempt("table", fallbackBase);
+          }
+          pushAttempt("figure", fallbackLabel);
+          pushAttempt("supplementary", fallbackLabel);
+        } else {
+          pushAttempt("figure", fallbackLabel);
+          if (fallbackBase !== fallbackLabel.toUpperCase()) {
+            pushAttempt("figure", fallbackBase);
+          }
+          pushAttempt("table", fallbackLabel);
+          pushAttempt("supplementary", fallbackLabel);
         }
       }
 
