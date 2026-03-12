@@ -2,10 +2,15 @@ import { randomUUID, createHash } from "node:crypto";
 import { dirname, basename } from "node:path";
 import { mkdirSync } from "node:fs";
 import Database from "better-sqlite3";
+import {
+  buildRecognizedGroupKey,
+  inferRecognizedDisplayFamily,
+} from "@journal-reader/types";
 import type {
   AnnotationItem,
   CitationRef,
   InTextReferenceMarker,
+  RecognizedDisplayFamily,
   Rect,
   ResolveCitationResponse,
   ResolveReferenceResponse,
@@ -31,6 +36,7 @@ type VisualTargetRow = {
   kind: TargetKind;
   label: string;
   page: number;
+  caption_page: number | null;
   crop_rect_json: string;
   caption_rect_json: string | null;
   caption: string;
@@ -212,9 +218,11 @@ export class StorageRepository {
   replaceAutoTargets(docId: string, targets: VisualTarget[]): void {
     const delStmt = this.db.prepare("DELETE FROM visual_targets WHERE doc_id = ? AND source = 'auto'");
     const insertStmt = this.db.prepare(
-      `INSERT INTO visual_targets (id, doc_id, kind, label, page, crop_rect_json, caption_rect_json, caption, confidence, source)
-       VALUES (@id, @doc_id, @kind, @label, @page, @crop_rect_json, @caption_rect_json, @caption, @confidence, @source)
+      `INSERT INTO visual_targets (id, doc_id, kind, label, page, caption_page, crop_rect_json, caption_rect_json, caption, confidence, source)
+       VALUES (@id, @doc_id, @kind, @label, @page, @caption_page, @crop_rect_json, @caption_rect_json, @caption, @confidence, @source)
        ON CONFLICT(id) DO UPDATE SET
+         page=excluded.page,
+         caption_page=excluded.caption_page,
          crop_rect_json=excluded.crop_rect_json,
          caption_rect_json=excluded.caption_rect_json,
          caption=excluded.caption,
@@ -230,6 +238,7 @@ export class StorageRepository {
           kind: target.kind,
           label: target.label,
           page: target.page,
+          caption_page: target.captionPage ?? target.page,
           crop_rect_json: JSON.stringify(target.cropRect),
           caption_rect_json: target.captionRect ? JSON.stringify(target.captionRect) : null,
           caption: target.caption,
@@ -253,6 +262,7 @@ export class StorageRepository {
       kind: row.kind,
       label: row.label,
       page: row.page,
+      captionPage: row.caption_page ?? row.page,
       cropRect: JSON.parse(row.crop_rect_json) as Rect,
       captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
       caption: row.caption,
@@ -269,6 +279,7 @@ export class StorageRepository {
       kind: row.kind,
       label: row.label,
       page: row.page,
+      captionPage: row.caption_page ?? row.page,
       cropRect: JSON.parse(row.crop_rect_json) as Rect,
       captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
       caption: row.caption,
@@ -279,9 +290,11 @@ export class StorageRepository {
 
   upsertTargets(targets: VisualTarget[]): void {
     const stmt = this.db.prepare(
-      `INSERT INTO visual_targets (id, doc_id, kind, label, page, crop_rect_json, caption_rect_json, caption, confidence, source)
-       VALUES (@id, @doc_id, @kind, @label, @page, @crop_rect_json, @caption_rect_json, @caption, @confidence, @source)
+      `INSERT INTO visual_targets (id, doc_id, kind, label, page, caption_page, crop_rect_json, caption_rect_json, caption, confidence, source)
+       VALUES (@id, @doc_id, @kind, @label, @page, @caption_page, @crop_rect_json, @caption_rect_json, @caption, @confidence, @source)
        ON CONFLICT(id) DO UPDATE SET
+         page=excluded.page,
+         caption_page=excluded.caption_page,
          crop_rect_json=excluded.crop_rect_json,
          caption_rect_json=excluded.caption_rect_json,
          caption=excluded.caption,
@@ -296,6 +309,7 @@ export class StorageRepository {
         kind: target.kind,
         label: target.label,
         page: target.page,
+        caption_page: target.captionPage ?? target.page,
         crop_rect_json: JSON.stringify(target.cropRect),
         caption_rect_json: target.captionRect ? JSON.stringify(target.captionRect) : null,
         caption: target.caption,
@@ -385,11 +399,16 @@ export class StorageRepository {
     };
   }
 
-  resolveCitationByKindLabel(docId: string, kind: TargetKind, label: string): ResolveCitationResponse | null {
+  resolveCitationByKindLabel(
+    docId: string,
+    kind: TargetKind,
+    label: string,
+    familyHint?: RecognizedDisplayFamily,
+  ): ResolveCitationResponse | null {
     const normalized = normalizeLabel(label);
     const base = baseLabel(normalized);
 
-    const citationRows = this.db
+    let citationRows = this.db
       .prepare(
         `SELECT c.*, m.target_id
          FROM citations c
@@ -399,6 +418,9 @@ export class StorageRepository {
            AND UPPER(c.label) = @label`,
       )
       .all({ doc_id: docId, kind, label: normalized }) as (CitationRow & { target_id: string | null })[];
+    if (familyHint) {
+      citationRows = citationRows.filter((row) => inferRecognizedDisplayFamily(row.kind, row.text) === familyHint);
+    }
 
     const chosenCitation =
       citationRows.sort((a, b) => {
@@ -416,14 +438,23 @@ export class StorageRepository {
       };
     }
 
-    const targetRows = this.db
+    let targetRows = this.db
       .prepare(
-        `SELECT id, label, source, confidence
+        `SELECT id, label, caption, source, confidence
          FROM visual_targets
          WHERE doc_id = @doc_id
            AND kind = @kind`,
       )
-      .all({ doc_id: docId, kind }) as Array<{ id: string; label: string; source: "auto" | "manual"; confidence: number }>;
+      .all({ doc_id: docId, kind }) as Array<{
+        id: string;
+        label: string;
+        caption: string;
+        source: "auto" | "manual";
+        confidence: number;
+      }>;
+    if (familyHint) {
+      targetRows = targetRows.filter((row) => inferRecognizedDisplayFamily(kind, row.caption) === familyHint);
+    }
 
     const exactTarget =
       targetRows
@@ -663,6 +694,7 @@ export class StorageRepository {
       kind: row.kind,
       label: row.label,
       page: row.page,
+      captionPage: row.caption_page ?? row.page,
       cropRect: JSON.parse(row.crop_rect_json) as Rect,
       captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
       caption: row.caption,
@@ -671,7 +703,12 @@ export class StorageRepository {
     };
   }
 
-  listTargetsByKindLabel(docId: string, kind: TargetKind, label: string): VisualTarget[] {
+  listTargetsByKindLabel(
+    docId: string,
+    kind: TargetKind,
+    label: string,
+    familyHint?: RecognizedDisplayFamily,
+  ): VisualTarget[] {
     const normalized = normalizeLabel(label);
     const base = baseLabel(normalized);
     const rows = this.db
@@ -684,6 +721,9 @@ export class StorageRepository {
       .all({ doc_id: docId, kind }) as VisualTargetRow[];
 
     const candidates = rows.filter((row) => {
+      if (familyHint && inferRecognizedDisplayFamily(row.kind, row.caption) !== familyHint) {
+        return false;
+      }
       const rowLabel = normalizeLabel(row.label);
       if (rowLabel === normalized) {
         return true;
@@ -698,6 +738,7 @@ export class StorageRepository {
         kind: row.kind,
         label: row.label,
         page: row.page,
+        captionPage: row.caption_page ?? row.page,
         cropRect: JSON.parse(row.crop_rect_json) as Rect,
         captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
         caption: row.caption,
@@ -735,6 +776,7 @@ export class StorageRepository {
       kind: row.kind,
       label: row.label,
       page: row.page,
+      captionPage: row.caption_page ?? row.page,
       cropRect: JSON.parse(row.crop_rect_json) as Rect,
       captionRect: row.caption_rect_json ? (JSON.parse(row.caption_rect_json) as Rect) : undefined,
       caption: row.caption,
@@ -888,6 +930,7 @@ export class StorageRepository {
       kind: citation.kind,
       label: citation.label,
       page: targetPage ?? citation.page,
+      captionPage: targetPage ?? citation.page,
       cropRect: targetRect,
       caption: captionText,
       confidence: 1,
@@ -908,31 +951,40 @@ export class StorageRepository {
     figuresCount: number;
     tablesCount: number;
     suppCount: number;
+    extCount: number;
   } {
     const refsCount = (
       this.db.prepare("SELECT COUNT(*) AS n FROM reference_entries WHERE doc_id = ?").get(docId) as { n: number }
     ).n;
-    const figuresCount = (
-      this.db
-        .prepare("SELECT COUNT(*) AS n FROM visual_targets WHERE doc_id = ? AND kind = 'figure'")
-        .get(docId) as { n: number }
-    ).n;
-    const tablesCount = (
-      this.db
-        .prepare("SELECT COUNT(*) AS n FROM visual_targets WHERE doc_id = ? AND kind = 'table'")
-        .get(docId) as { n: number }
-    ).n;
-    const suppCount = (
-      this.db
-        .prepare("SELECT COUNT(*) AS n FROM visual_targets WHERE doc_id = ? AND kind = 'supplementary'")
-        .get(docId) as { n: number }
-    ).n;
+    const targets = this.listAllTargets(docId);
+    const figuresCount = new Set<string>();
+    const tablesCount = new Set<string>();
+    const suppCount = new Set<string>();
+    const extCount = new Set<string>();
+    for (const target of targets) {
+      const family = inferRecognizedDisplayFamily(target.kind, target.caption);
+      const groupKey = buildRecognizedGroupKey(target.kind, target.label, target.caption);
+      if (family === "figure") {
+        figuresCount.add(groupKey);
+        continue;
+      }
+      if (family === "table") {
+        tablesCount.add(groupKey);
+        continue;
+      }
+      if (family.startsWith("extended-data-")) {
+        extCount.add(groupKey);
+        continue;
+      }
+      suppCount.add(groupKey);
+    }
 
     return {
       refsCount,
-      figuresCount,
-      tablesCount,
-      suppCount,
+      figuresCount: figuresCount.size,
+      tablesCount: tablesCount.size,
+      suppCount: suppCount.size,
+      extCount: extCount.size,
     };
   }
 }

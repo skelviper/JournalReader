@@ -208,4 +208,66 @@ describe("StorageRepository", () => {
     const resolved = repo.resolveCitationByKindLabel(opened.docId, "figure", "1B");
     expect(resolved?.targetId).toBe("t-main");
   });
+
+  it("honors family hint so Fig. S1 never falls back to Table S1", () => {
+    const opened = repo.openDocument("/tmp/paper6.pdf", 8, "paper6.pdf");
+
+    repo.replaceCitations(opened.docId, [
+      {
+        id: "c-s1-fig",
+        docId: opened.docId,
+        page: 2,
+        text: "Supplementary Fig. S1",
+        kind: "supplementary",
+        label: "S1",
+        bbox: { x: 20, y: 40, w: 90, h: 12 },
+      },
+      {
+        id: "c-s1-table",
+        docId: opened.docId,
+        page: 2,
+        text: "Supplementary Table S1",
+        kind: "supplementary",
+        label: "S1",
+        bbox: { x: 20, y: 60, w: 100, h: 12 },
+      },
+    ]);
+
+    repo.upsertTargets([
+      {
+        id: "t-s1-fig",
+        docId: opened.docId,
+        kind: "supplementary",
+        label: "S1A",
+        page: 6,
+        cropRect: { x: 12, y: 12, w: 200, h: 150 },
+        caption: "Supplementary Fig. S1: image",
+        confidence: 0.7,
+        source: "auto",
+      },
+      {
+        id: "t-s1-table",
+        docId: opened.docId,
+        kind: "supplementary",
+        label: "S1",
+        page: 7,
+        cropRect: { x: 10, y: 10, w: 180, h: 120 },
+        caption: "Supplementary Table S1: statistics",
+        confidence: 0.9,
+        source: "auto",
+      },
+    ]);
+
+    const figResolved = repo.resolveCitationByKindLabel(opened.docId, "supplementary", "S1", "supplementary-figure");
+    expect(figResolved?.targetId).toBe("t-s1-fig");
+
+    const tableResolved = repo.resolveCitationByKindLabel(opened.docId, "supplementary", "S1", "supplementary-table");
+    expect(tableResolved?.targetId).toBe("t-s1-table");
+
+    const figCandidates = repo.listTargetsByKindLabel(opened.docId, "supplementary", "S1", "supplementary-figure");
+    expect(figCandidates.map((item) => item.id)).toEqual(["t-s1-fig"]);
+
+    const tableCandidates = repo.listTargetsByKindLabel(opened.docId, "supplementary", "S1", "supplementary-table");
+    expect(tableCandidates.map((item) => item.id)).toEqual(["t-s1-table"]);
+  });
 });

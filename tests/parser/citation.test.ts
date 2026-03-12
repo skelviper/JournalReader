@@ -90,4 +90,28 @@ describe("extractCitations", () => {
       expect.arrayContaining(["supplementary:4A", "supplementary:4B"]),
     );
   });
+
+  it("handles split Extended Data prefix and Fig label across spans", () => {
+    const spans = [
+      {
+        text: "See Extended Data",
+        page: 9,
+        bbox: { x: 12, y: 84, w: 120, h: 14 },
+      },
+      {
+        text: "Fig. 1a-j",
+        page: 9,
+        bbox: { x: 136, y: 84, w: 88, h: 14 },
+      },
+      {
+        text: "for the full benchmark.",
+        page: 9,
+        bbox: { x: 228, y: 84, w: 140, h: 14 },
+      },
+    ];
+
+    const out = extractCitations(spans, "docE");
+    const labels = out.filter((item) => item.kind === "supplementary").map((item) => item.label);
+    expect(labels).toEqual(expect.arrayContaining(["1A", "1J"]));
+  });
 });

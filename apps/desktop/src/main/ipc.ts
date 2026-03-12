@@ -5,12 +5,21 @@ import { join } from "node:path";
 import { extractCitations, extractCaptions, extractReferenceData, inferReferenceCount, mapCitationsToTargets } from "@journal-reader/parser";
 import {
   buildTargetPreviewDataUrl,
+  extractPdfOutline,
   extractTextSpans,
   loadAnnotationsFromPdf,
   openPdfMetadata,
   saveAnnotationsToPdf,
 } from "@journal-reader/pdf-core";
 import { StorageRepository } from "@journal-reader/storage";
+import {
+  baseTargetLabel,
+  buildRecognizedDisplayLabel,
+  buildRecognizedGroupKey,
+  inferRecognizedDisplayFamily,
+  type RecognizedDisplayFamily,
+  type TargetKind,
+} from "@journal-reader/types";
 import type {
   AnnotationItem,
   BindManuallyResponse,
@@ -73,8 +82,72 @@ function normalizeAnnotationPayload(item: AnnotationItem, docId: string): Annota
   };
 }
 
-function isExtendedDataCaption(text: string): boolean {
-  return /^\s*extended\s+data\s+fig(?:ure)?\b/i.test(text);
+type GroupedRecognizedTarget = {
+  key: string;
+  displayLabel: string;
+  family: RecognizedDisplayFamily;
+  representative: ReturnType<StorageRepository["listAllTargets"]>[number];
+};
+
+function groupRecognizedTargets(
+  targets: ReturnType<StorageRepository["listAllTargets"]>,
+  kind: RecognizedPopupKind,
+): GroupedRecognizedTarget[] {
+  const filtered = targets.filter((target) => {
+    const family = inferRecognizedDisplayFamily(target.kind, target.caption);
+    if (kind === "fig") {
+      return family === "figure";
+    }
+    if (kind === "table") {
+      return family === "table";
+    }
+    if (kind === "ext") {
+      return family === "extended-data-figure" || family === "extended-data-table";
+    }
+    if (kind === "supp") {
+      return family === "supplementary-figure" || family === "supplementary-table";
+    }
+    return false;
+  });
+
+  const grouped = new Map<string, GroupedRecognizedTarget>();
+  for (const target of filtered) {
+    const family = inferRecognizedDisplayFamily(target.kind, target.caption);
+    const key = buildRecognizedGroupKey(target.kind, target.label, target.caption);
+    const displayLabel = buildRecognizedDisplayLabel(target.kind, target.label, target.caption);
+    const prev = grouped.get(key);
+    if (!prev) {
+      grouped.set(key, { key, displayLabel, family, representative: target });
+      continue;
+    }
+    const prevManual = prev.representative.source === "manual" ? 1 : 0;
+    const nextManual = target.source === "manual" ? 1 : 0;
+    if (nextManual > prevManual || (nextManual === prevManual && target.confidence > prev.representative.confidence)) {
+      grouped.set(key, { key, displayLabel, family, representative: target });
+    }
+  }
+
+  const orderScore = (item: GroupedRecognizedTarget): number => {
+    const familyBase =
+      item.family === "figure"
+        ? 0
+        : item.family === "table"
+          ? 1000
+          : item.family.startsWith("extended-data")
+            ? 2000
+            : 3000;
+    const base = Number(baseTargetLabel(item.representative.label).replace(/^S/i, "")) || 9999;
+    return familyBase + base;
+  };
+
+  return [...grouped.values()].sort((a, b) => {
+    const oa = orderScore(a);
+    const ob = orderScore(b);
+    if (oa !== ob) {
+      return oa - ob;
+    }
+    return a.displayLabel.localeCompare(b.displayLabel);
+  });
 }
 
 async function ensureAnnotationsLoaded(repo: StorageRepository, docId: string): Promise<AnnotationItem[]> {
@@ -994,27 +1067,37 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     repo.replaceCitationMappings(mapped.citationsToTarget);
 
     const stats = repo.stats(docId);
-    const extCount = mapped.targets.filter(
-      (target) => target.kind === "supplementary" && isExtendedDataCaption(target.caption ?? ""),
-    ).length;
     const refsCount = inferReferenceCount(references.entries, references.markers);
     return {
       status: "ok" as const,
       refsCount,
       figuresCount: stats.figuresCount,
       tablesCount: stats.tablesCount,
-      extCount,
-      suppCount: Math.max(0, stats.suppCount - extCount),
+      extCount: stats.extCount,
+      suppCount: stats.suppCount,
     };
+  });
+
+  ipcMain.handle("doc.getOutline", async (_event, docId: string) => {
+    const path = repo.getDocumentPath(docId);
+    if (!path) {
+      return [];
+    }
+    const cached = spanCache.get(docId);
+    const outline = await extractPdfOutline(path, cached);
+    return outline;
   });
 
   ipcMain.handle("citation.resolve", (_event, docId: string, page: number, x: number, y: number) => {
     return repo.resolveCitationAtPoint(docId, page, x, y);
   });
 
-  ipcMain.handle("citation.resolveByLabel", (_event, docId: string, kind: string, label: string) => {
-    return repo.resolveCitationByKindLabel(docId, kind as "figure" | "table" | "supplementary", label);
-  });
+  ipcMain.handle(
+    "citation.resolveByLabel",
+    (_event, docId: string, kind: string, label: string, familyHint?: RecognizedDisplayFamily) => {
+      return repo.resolveCitationByKindLabel(docId, kind as "figure" | "table" | "supplementary", label, familyHint);
+    },
+  );
 
   ipcMain.handle("reference.resolve", (_event, docId: string, page: number, x: number, y: number) => {
     return repo.resolveReferenceAtPoint(docId, page, x, y);
@@ -1080,6 +1163,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
 
     return {
       page: target.page,
+      captionPage: target.captionPage ?? target.page,
       cropRect: target.cropRect,
       captionRect: target.captionRect,
       caption: target.caption,
@@ -1087,9 +1171,18 @@ export function registerIpcHandlers(repo: StorageRepository): void {
     };
   });
 
-  ipcMain.handle("figure.listTargets", (_event, docId: string, kind: "figure" | "table" | "supplementary", label: string) => {
-    return repo.listTargetsByKindLabel(docId, kind, label);
-  });
+  ipcMain.handle(
+    "figure.listTargets",
+    (
+      _event,
+      docId: string,
+      kind: "figure" | "table" | "supplementary",
+      label: string,
+      familyHint?: RecognizedDisplayFamily,
+    ) => {
+      return repo.listTargetsByKindLabel(docId, kind, label, familyHint);
+    },
+  );
 
   ipcMain.handle("recognized.openPopup", async (_event, docId: string, kind: RecognizedPopupKind) => {
     try {
@@ -1100,6 +1193,7 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         minHeight: 520,
         title: "Recognized Items",
         webPreferences: {
+          preload: join(app.getAppPath(), "preload.cjs"),
           contextIsolation: true,
           nodeIntegration: false,
           sandbox: false,
@@ -1119,29 +1213,27 @@ export function registerIpcHandlers(repo: StorageRepository): void {
             )
             .join("");
         } else {
-          const targetKind = kind === "fig" ? "figure" : kind === "table" ? "table" : "supplementary";
           title =
             kind === "fig"
               ? "Recognized Figures"
               : kind === "ext"
-                ? "Recognized Extended Data Figures"
+                ? "Recognized Extended Data Items"
               : kind === "supp"
-                ? "Recognized Supplementary Figures/Tables"
+                ? "Recognized Supplementary Items"
                 : "Recognized Tables";
-          const allTargets = repo.listTargetsByKind(docId, targetKind);
-          const targets =
-            kind === "ext"
-              ? allTargets.filter((target) => isExtendedDataCaption(typeof target.caption === "string" ? target.caption : ""))
-              : kind === "supp"
-                ? allTargets.filter((target) => !isExtendedDataCaption(typeof target.caption === "string" ? target.caption : ""))
-                : allTargets;
+          const targets = groupRecognizedTargets(repo.listAllTargets(docId), kind);
           rows = targets
-            .map((target) => {
+            .map((entry) => {
+              const target = entry.representative;
               const caption = normalizeSnippet(typeof target.caption === "string" ? target.caption : "").slice(0, 600);
-              const label = typeof target.label === "string" ? target.label : String(target.label ?? "");
               const source = typeof target.source === "string" ? target.source : "auto";
               const confidence = Number.isFinite(target.confidence) ? target.confidence : 0;
-              return `<div class="row"><div class="id">${escapeHtml(label)}</div><div><div class="txt">${escapeHtml(caption)}</div><div class="meta">p.${target.page} | ${escapeHtml(source)} | conf ${confidence.toFixed(2)}</div></div></div>`;
+              const captionPage = target.captionPage ?? target.page;
+              const pageMeta =
+                captionPage !== target.page
+                  ? `img p.${target.page} | caption p.${captionPage}`
+                  : `p.${target.page}`;
+              return `<div class="row"><div><button class="id jump-target" data-doc-id="${escapeHtml(docId)}" data-target-id="${escapeHtml(target.id)}" data-label="${escapeHtml(entry.displayLabel)}">${escapeHtml(entry.displayLabel)}</button></div><div><div class="txt">${escapeHtml(caption)}</div><div class="meta">${pageMeta} | ${escapeHtml(source)} | conf ${confidence.toFixed(2)}</div></div></div>`;
             })
             .join("");
         }
@@ -1158,13 +1250,87 @@ export function registerIpcHandlers(repo: StorageRepository): void {
         .list{display:flex;flex-direction:column;gap:10px}
         .row{display:grid;grid-template-columns:100px 1fr;gap:10px;background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:10px}
         .id{font-weight:700;color:#26466a;word-break:break-word}
+        .jump-target{border:none;background:transparent;padding:0;margin:0;font:inherit;font-weight:700;color:#1f4f87;text-align:left;cursor:pointer}
+        .jump-target:hover{text-decoration:underline}
+        .jump-target:disabled{opacity:.55;cursor:default}
         .txt{line-height:1.48;white-space:pre-wrap;word-break:break-word}
         .meta{color:#64748b;font-size:12px;margin-top:4px}
         .empty{background:#fff;border:1px solid #cbd7e4;border-radius:10px;padding:12px}
+        .status{position:sticky;bottom:0;margin-top:10px;padding:8px 10px;border:1px solid #cbd7e4;border-radius:8px;background:#f7fafe;color:#4a5f78;font-size:12px}
         </style>
         </head><body>
         <div class="head">${escapeHtml(title)}</div>
-        ${rows.includes('class="empty"') ? rows : rows ? `<div class="list">${rows}</div>` : `<div class="empty">No recognized items found.</div>`}
+        ${
+          rows.includes('class="empty"')
+            ? rows
+            : rows
+              ? `<div class="list" id="recognized-list">${rows}</div>`
+              : `<div class="empty">No recognized items found.</div>`
+        }
+        <div class="status" id="recognized-status">Click the left label to open this figure/table.</div>
+        <script>
+        (() => {
+          const list = document.getElementById("recognized-list");
+          const status = document.getElementById("recognized-status");
+          if (!list) {
+            return;
+          }
+          list.addEventListener("click", async (event) => {
+            const button = event.target instanceof Element ? event.target.closest(".jump-target") : null;
+            if (!(button instanceof HTMLButtonElement)) {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+
+            const api = window.journalApi;
+            if (!api || typeof api.figureGetTarget !== "function" || typeof api.figureOpenPopup !== "function") {
+              if (status) {
+                status.textContent = "Desktop API unavailable in popup.";
+              }
+              return;
+            }
+
+            const targetId = button.dataset.targetId;
+            const currentDocId = button.dataset.docId;
+            if (!targetId || !currentDocId) {
+              if (status) {
+                status.textContent = "Missing recognized target id.";
+              }
+              return;
+            }
+
+            const displayLabel = button.dataset.label || button.textContent || targetId;
+            button.disabled = true;
+            try {
+              if (status) {
+                status.textContent = "Opening " + displayLabel + "...";
+              }
+              const target = await api.figureGetTarget(currentDocId, targetId);
+              await api.figureOpenPopup({
+                docId: currentDocId,
+                targetId,
+                page: target.page,
+                captionPage: target.captionPage ?? target.page,
+                cropRect: target.cropRect,
+                captionRect: target.captionRect,
+                caption: target.caption,
+                imageDataUrl: target.imageDataUrl,
+              });
+              if (status) {
+                status.textContent = "Opened " + displayLabel + ".";
+              }
+            } catch (error) {
+              if (status) {
+                status.textContent = "Failed to open " + displayLabel + ".";
+              }
+              console.error("[journal-reader] recognized item open failed", error);
+            } finally {
+              button.disabled = false;
+            }
+          });
+        })();
+        </script>
         </body></html>`;
 
       try {

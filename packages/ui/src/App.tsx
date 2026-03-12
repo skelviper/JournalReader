@@ -6,7 +6,9 @@ import type {
   AnnotationItem,
   FigureTargetCandidate,
   NoteTextStyle,
+  OutlineNode,
   Rect,
+  RecognizedDisplayFamily,
   RecognizedPopupKind,
   TargetKind,
   TranslateProvider,
@@ -61,6 +63,8 @@ type HighlightMenuState = {
   y: number;
   annotationId: string;
 };
+
+type SidebarTab = "thumbnails" | "outline";
 
 type TranslationSettings = {
   provider: TranslateProvider;
@@ -280,6 +284,7 @@ function ToolButton({
   title,
   active = false,
   primary = false,
+  disabled = false,
   onMouseDown,
   onClick,
   children,
@@ -287,13 +292,22 @@ function ToolButton({
   title: string;
   active?: boolean;
   primary?: boolean;
+  disabled?: boolean;
   onMouseDown?: (event: ReactMouseEvent<HTMLButtonElement>) => void;
   onClick: () => void;
   children: JSX.Element;
 }): JSX.Element {
   const className = `tool-btn${active ? " active" : ""}${primary ? " primary" : ""}`;
   return (
-    <button type="button" className={className} onMouseDown={onMouseDown} onClick={onClick} title={title} aria-label={title}>
+    <button
+      type="button"
+      className={className}
+      onMouseDown={onMouseDown}
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      disabled={disabled}
+    >
       {children}
     </button>
   );
@@ -428,9 +442,39 @@ function extractReferenceIndices(text: string): number[] {
   return parsed;
 }
 
-function parseCitationSelection(text: string): { kind: TargetKind; label: string } | null {
+function inferSelectionFamilyHint(kind: TargetKind, normalizedText: string): RecognizedDisplayFamily | undefined {
+  const hasExtended = /\bextended[\s-]*data\b/i.test(normalizedText);
+  const hasSupplementary = /\bsupp(?:lementary)?\b/i.test(normalizedText);
+  const hasTableCue = /\btable\b/i.test(normalizedText);
+  const hasFigureCue = /\bfig(?:ure)?\.?\b/i.test(normalizedText);
+  if (kind === "figure") {
+    return "figure";
+  }
+  if (kind === "table") {
+    return "table";
+  }
+  if (hasExtended) {
+    return hasTableCue ? "extended-data-table" : "extended-data-figure";
+  }
+  if (hasSupplementary) {
+    return hasTableCue ? "supplementary-table" : "supplementary-figure";
+  }
+  if (kind === "supplementary") {
+    if (hasTableCue && !hasFigureCue) {
+      return "supplementary-table";
+    }
+    if (hasFigureCue && !hasTableCue) {
+      return "supplementary-figure";
+    }
+  }
+  return undefined;
+}
+
+function parseCitationSelection(text: string): { kind: TargetKind; label: string; familyHint?: RecognizedDisplayFamily } | null {
   const normalized = text.replace(/\s+/g, " ").trim();
   const hasSupplementaryCue = hasSupplementaryCueInSelection(normalized);
+  const hasTableCue = /\btable\b/i.test(normalized);
+  const hasFigureCue = /\bfig(?:ure)?\.?\b/i.test(normalized);
   const match = normalized.match(
     /(Supplementary\s+(?:Figure|Fig\.?|Table)|Extended\s+Data\s+(?:Figure|Fig\.?|Table)|Figure|Fig\.?|Table)\.?\s*(S?\d+)\s*([A-Za-z]?)/i,
   );
@@ -441,19 +485,20 @@ function parseCitationSelection(text: string): { kind: TargetKind; label: string
   const base = (match[2] ?? "").trim().toUpperCase();
   const suffix = (match[3] ?? "").trim().toUpperCase();
   const label = `${base}${suffix}`;
-  let kind: TargetKind = prefix.includes("table")
-    ? prefix.includes("supplementary") || prefix.includes("extended data") || label.startsWith("S")
-      ? "supplementary"
-      : "table"
-    : prefix.includes("supplementary") || prefix.includes("extended data") || label.startsWith("S")
-      ? "supplementary"
-      : "figure";
+  let kind: TargetKind = "figure";
+  if (hasSupplementaryCue || prefix.includes("supplementary") || prefix.includes("extended data") || label.startsWith("S")) {
+    kind = "supplementary";
+  } else if (prefix.includes("table") || (hasTableCue && !hasFigureCue)) {
+    kind = "table";
+  } else {
+    kind = "figure";
+  }
   // Selection text can cross line breaks and punctuation, causing prefix to be parsed as plain "Fig.".
   // If the selected snippet still contains "Extended Data"/"Supplementary", force supplementary mapping first.
   if (kind !== "supplementary" && hasSupplementaryCue) {
     kind = "supplementary";
   }
-  return { kind, label };
+  return { kind, label, familyHint: inferSelectionFamilyHint(kind, normalized) };
 }
 
 function hasSupplementaryCueInSelection(text: string): boolean {
@@ -1239,10 +1284,20 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   const [findMatches, setFindMatches] = useState<number[]>([]);
   const [findCursor, setFindCursor] = useState(-1);
   const [findRequest, setFindRequest] = useState<DocumentFindRequest | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("thumbnails");
+  const [outlineNodes, setOutlineNodes] = useState<OutlineNode[]>([]);
+  const [thumbnailUrls, setThumbnailUrls] = useState<Record<number, string>>({});
+  const thumbnailUrlRef = useRef<Record<number, string>>({});
+  const thumbnailTaskRef = useRef<Map<number, Promise<void>>>(new Map());
 
   useEffect(() => {
     scaleRef.current = scale;
   }, [scale]);
+
+  useEffect(() => {
+    thumbnailUrlRef.current = thumbnailUrls;
+  }, [thumbnailUrls]);
 
   useEffect(() => {
     return () => {
@@ -1471,9 +1526,18 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         setActivePage(1);
         setPendingCitation(null);
         setAnnotations(await api.annotationList(opened.docId));
+        setSidebarTab("thumbnails");
+        setIsSidebarOpen(true);
+        setOutlineNodes([]);
+        setThumbnailUrls({});
+        thumbnailTaskRef.current.clear();
 
-        const parsed = await api.docParse(opened.docId);
+        const [parsed, outline] = await Promise.all([
+          api.docParse(opened.docId),
+          api.docGetOutline(opened.docId).catch(() => []),
+        ]);
         setStats(parsed);
+        setOutlineNodes(outline);
         setStatusText(`Loaded ${opened.title}`);
       } catch (error) {
         setErrorText(formatError(error));
@@ -1481,6 +1545,60 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       }
     },
     [api],
+  );
+
+  const jumpToPage = useCallback((page: number): void => {
+    if (!pdfDoc) {
+      return;
+    }
+    const clamped = Math.max(1, Math.min(pdfDoc.numPages, Math.floor(page)));
+    setActivePage(clamped);
+    const reader = readerRef.current;
+    const pageElement = reader?.querySelector<HTMLElement>(`.page-wrap[data-page="${clamped}"]`);
+    pageElement?.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+  }, [pdfDoc]);
+
+  const ensureThumbnail = useCallback(
+    async (pageNumber: number): Promise<void> => {
+      if (!pdfDoc) {
+        return;
+      }
+      const existing = thumbnailUrlRef.current[pageNumber];
+      if (existing) {
+        return;
+      }
+      const pending = thumbnailTaskRef.current.get(pageNumber);
+      if (pending) {
+        await pending;
+        return;
+      }
+      const task = (async () => {
+        const page = await pdfDoc.getPage(pageNumber);
+        const viewport = page.getViewport({ scale: 0.24 });
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) {
+          return;
+        }
+        canvas.width = Math.max(1, Math.floor(viewport.width));
+        canvas.height = Math.max(1, Math.floor(viewport.height));
+        await page.render({ canvasContext: context, viewport }).promise;
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.86);
+        setThumbnailUrls((prev) => {
+          if (prev[pageNumber]) {
+            return prev;
+          }
+          return { ...prev, [pageNumber]: dataUrl };
+        });
+      })();
+      thumbnailTaskRef.current.set(pageNumber, task);
+      try {
+        await task;
+      } finally {
+        thumbnailTaskRef.current.delete(pageNumber);
+      }
+    },
+    [pdfDoc],
   );
 
   useEffect(() => {
@@ -1557,6 +1675,12 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
   }, [docId]);
 
   useEffect(() => {
+    setOutlineNodes([]);
+    setThumbnailUrls({});
+    thumbnailTaskRef.current.clear();
+  }, [docId]);
+
+  useEffect(() => {
     pageTextCacheRef.current.clear();
     lastFindQueryRef.current = "";
     setFindMatches([]);
@@ -1564,12 +1688,16 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
     setFindQuery("");
   }, [docId, pdfDoc]);
 
-  async function openFigureFromResolved(resolved: { targetId: string | null; kind: string; label: string }): Promise<void> {
+  async function openFigureFromResolved(
+    resolved: { targetId: string | null; kind: string; label: string },
+    familyHint?: RecognizedDisplayFamily,
+    citationPageHint?: number,
+  ): Promise<void> {
     if (!docId || !resolved.targetId) {
       return;
     }
     const normalizedKind = (resolved.kind === "table" || resolved.kind === "supplementary" ? resolved.kind : "figure") as TargetKind;
-    const candidatesFromDb = await api.figureListTargets(docId, normalizedKind, resolved.label).catch(() => []);
+    const candidatesFromDb = await api.figureListTargets(docId, normalizedKind, resolved.label, familyHint).catch(() => []);
     const fallbackTarget = await api.figureGetTarget(docId, resolved.targetId);
     const fallbackCandidate: FigureTargetCandidate = {
       id: resolved.targetId,
@@ -1577,6 +1705,7 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       kind: normalizedKind,
       label: resolved.label,
       page: fallbackTarget.page,
+      captionPage: fallbackTarget.captionPage ?? fallbackTarget.page,
       cropRect: fallbackTarget.cropRect,
       captionRect: fallbackTarget.captionRect,
       caption: fallbackTarget.caption,
@@ -1633,12 +1762,13 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         if (!candidate.captionRect) {
           return Promise.resolve(null);
         }
+        const captionPage = candidate.captionPage ?? candidate.page;
         const key = `${candidate.id}:${candidate.page}:${allowFallback ? "1" : "0"}`;
         const cached = nearDetectionCache.get(key);
         if (cached) {
           return cached;
         }
-        const pending = detectVisualRegionNearCaption(pdfDoc, candidate.page, candidate.captionRect, normalizedKind, {
+        const pending = detectVisualRegionNearCaption(pdfDoc, captionPage, candidate.captionRect, normalizedKind, {
           allowFallback,
         }).catch(() => null);
         nearDetectionCache.set(key, pending);
@@ -1664,7 +1794,7 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
           bestScore = score;
           chosen = candidate;
           chosenImagePage = imagePage;
-          chosenCaptionPage = candidate.page;
+          chosenCaptionPage = candidate.captionPage ?? candidate.page;
           chosenCaptionRect = candidate.captionRect;
           chosenCropRect = detection.rect;
           chosenDetectionMode = detection.mode;
@@ -1672,38 +1802,48 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       };
 
       for (const candidate of candidates) {
-        const captionPage = Math.max(1, Math.min(pdfDoc.numPages, candidate.page));
+        const imageAnchorPage = Math.max(1, Math.min(pdfDoc.numPages, candidate.page));
+        const captionPage = Math.max(1, Math.min(pdfDoc.numPages, candidate.captionPage ?? candidate.page));
         const looksLikePlaceholder = /\bsee\s+next\s+page\s+for\s+caption\b/i.test(candidate.caption);
-        let hasNearCaptionMatch = false;
+        let hasNearCaptionComponentMatch = false;
 
-        if (candidate.captionRect) {
+        if (candidate.captionRect && captionPage === imageAnchorPage) {
           const near = await detectNearCaption(candidate, false);
           if (near?.mode === "component") {
-            hasNearCaptionMatch = true;
+            hasNearCaptionComponentMatch = true;
             const nearBias = looksLikePlaceholder ? -4 : 14;
-            await considerCandidate(candidate, captionPage, near, nearBias);
-          } else {
+            await considerCandidate(candidate, imageAnchorPage, near, nearBias);
+          } else if (normalizedKind === "table") {
             const nearFallback = await detectNearCaption(candidate, true);
             if (nearFallback) {
-              hasNearCaptionMatch = true;
-              const fallbackBias = looksLikePlaceholder ? -6 : 7;
-              await considerCandidate(candidate, captionPage, nearFallback, fallbackBias);
+              const fallbackBias = looksLikePlaceholder ? -10 : -6;
+              await considerCandidate(candidate, imageAnchorPage, nearFallback, fallbackBias);
             }
           }
         }
 
-        if (hasNearCaptionMatch && !looksLikePlaceholder) {
+        if (hasNearCaptionComponentMatch && !looksLikePlaceholder && !citationPageHint) {
           continue;
         }
 
-        const probeRadius = looksLikePlaceholder ? 3 : 0;
-        const probePages = new Set<number>([captionPage]);
-        for (let step = 1; step <= probeRadius; step += 1) {
-          if (captionPage - step >= 1) {
-            probePages.add(captionPage - step);
-          }
-          if (captionPage + step <= pdfDoc.numPages) {
-            probePages.add(captionPage + step);
+        const probeRadius = looksLikePlaceholder ? 4 : hasNearCaptionComponentMatch ? 1 : normalizedKind === "table" ? 2 : 5;
+        const probeAnchors = new Set<number>([imageAnchorPage]);
+        if (captionPage !== imageAnchorPage) {
+          probeAnchors.add(captionPage);
+        }
+        if (Number.isFinite(citationPageHint)) {
+          probeAnchors.add(Math.max(1, Math.min(pdfDoc.numPages, Math.floor(citationPageHint as number))));
+        }
+
+        const probePages = new Set<number>();
+        for (const anchor of probeAnchors) {
+          for (let step = 0; step <= probeRadius; step += 1) {
+            if (anchor - step >= 1) {
+              probePages.add(anchor - step);
+            }
+            if (anchor + step <= pdfDoc.numPages) {
+              probePages.add(anchor + step);
+            }
           }
         }
 
@@ -1712,18 +1852,35 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
           if (!detected) {
             continue;
           }
-          const distancePenalty = Math.abs(probePage - captionPage) * (normalizedKind === "table" ? 4.5 : 5.8);
-          const forwardBonus = looksLikePlaceholder && probePage > captionPage ? 8 : 0;
-          const samePagePlaceholderPenalty = looksLikePlaceholder && probePage === captionPage ? -9 : 0;
-          await considerCandidate(candidate, probePage, detected, forwardBonus + samePagePlaceholderPenalty - distancePenalty);
+          const distancePenalty = Math.abs(probePage - imageAnchorPage) * (normalizedKind === "table" ? 3.8 : 4.8);
+          const hintPenalty = Number.isFinite(citationPageHint)
+            ? Math.abs(probePage - (citationPageHint as number)) * 1.25
+            : 0;
+          const forwardBonus = looksLikePlaceholder && probePage > imageAnchorPage ? 8 : 0;
+          const samePagePlaceholderPenalty = looksLikePlaceholder && probePage === imageAnchorPage ? -9 : 0;
+          const captionProbeBias =
+            !hasNearCaptionComponentMatch && normalizedKind !== "table" && probePage !== captionPage ? 2.5 : 0;
+          const sameCaptionPagePenalty =
+            !hasNearCaptionComponentMatch && normalizedKind !== "table" && probePage === captionPage ? -11 : 0;
+          await considerCandidate(
+            candidate,
+            probePage,
+            detected,
+            forwardBonus + samePagePlaceholderPenalty + captionProbeBias + sameCaptionPagePenalty - distancePenalty - hintPenalty,
+          );
         }
       }
 
-      if (chosenDetectionMode !== "component" && chosen.captionRect) {
+      if (
+        normalizedKind === "table" &&
+        chosenDetectionMode !== "component" &&
+        chosen.captionRect &&
+        (chosen.captionPage ?? chosen.page) === chosen.page
+      ) {
         const fallbackDetected = await detectNearCaption(chosen, true);
         if (fallbackDetected) {
           chosenImagePage = chosen.page;
-          chosenCaptionPage = chosen.page;
+          chosenCaptionPage = chosen.captionPage ?? chosen.page;
           chosenCaptionRect = chosen.captionRect;
           chosenCropRect = fallbackDetected.rect;
           chosenDetectionMode = fallbackDetected.mode;
@@ -1952,50 +2109,38 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
       const normalizedSelection = selectionMenu.text.replace(/\s+/g, " ").trim();
       const hasSupplementaryCue = hasSupplementaryCueInSelection(normalizedSelection);
       const hasTableCue = /\btable\b/i.test(normalizedSelection);
+      const hasFigureCue = /\bfig(?:ure)?\.?\b/i.test(normalizedSelection);
+      const inferredKind: TargetKind = hasSupplementaryCue ? "supplementary" : hasTableCue && !hasFigureCue ? "table" : "figure";
+      const inferredFamily = inferSelectionFamilyHint(inferredKind, normalizedSelection);
 
-      const attempts: Array<{ kind: TargetKind; label: string }> = [];
+      const attempts: Array<{ kind: TargetKind; label: string; familyHint?: RecognizedDisplayFamily }> = [];
       const seenAttempts = new Set<string>();
-      const pushAttempt = (kind: TargetKind, rawLabel: string): void => {
+      const pushAttempt = (kind: TargetKind, rawLabel: string, familyHint?: RecognizedDisplayFamily): void => {
         const label = rawLabel.trim().toUpperCase();
         if (!label) {
           return;
         }
-        const key = `${kind}:${label}`;
+        const key = `${kind}:${familyHint ?? ""}:${label}`;
         if (seenAttempts.has(key)) {
           return;
         }
         seenAttempts.add(key);
-        attempts.push({ kind, label });
+        attempts.push({ kind, label, familyHint });
       };
       if (parsed) {
-        const primaryKind: TargetKind = hasSupplementaryCue ? "supplementary" : parsed.kind;
-        pushAttempt(primaryKind, parsed.label);
+        pushAttempt(parsed.kind, parsed.label, parsed.familyHint);
         const parsedBase = citationBaseLabel(parsed.label);
         if (parsedBase !== parsed.label.toUpperCase()) {
-          pushAttempt(primaryKind, parsedBase);
+          pushAttempt(parsed.kind, parsedBase, parsed.familyHint);
         }
       }
       if (fallbackLabel) {
         const fallbackBase = citationBaseLabel(fallbackLabel);
-        if (hasSupplementaryCue) {
-          pushAttempt("supplementary", fallbackLabel);
+        if (!parsed) {
+          pushAttempt(inferredKind, fallbackLabel, inferredFamily);
           if (fallbackBase !== fallbackLabel.toUpperCase()) {
-            pushAttempt("supplementary", fallbackBase);
+            pushAttempt(inferredKind, fallbackBase, inferredFamily);
           }
-        } else if (hasTableCue) {
-          pushAttempt("table", fallbackLabel);
-          if (fallbackBase !== fallbackLabel.toUpperCase()) {
-            pushAttempt("table", fallbackBase);
-          }
-          pushAttempt("figure", fallbackLabel);
-          pushAttempt("supplementary", fallbackLabel);
-        } else {
-          pushAttempt("figure", fallbackLabel);
-          if (fallbackBase !== fallbackLabel.toUpperCase()) {
-            pushAttempt("figure", fallbackBase);
-          }
-          pushAttempt("table", fallbackLabel);
-          pushAttempt("supplementary", fallbackLabel);
         }
       }
 
@@ -2008,9 +2153,9 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
 
       let opened = false;
       for (const attempt of attempts) {
-        const resolved = await api.citationResolveByLabel(docId, attempt.kind, attempt.label);
+        const resolved = await api.citationResolveByLabel(docId, attempt.kind, attempt.label, attempt.familyHint);
         if (resolved?.targetId) {
-          await openFigureFromResolved(resolved);
+          await openFigureFromResolved(resolved, attempt.familyHint, selectionMenu.page);
           opened = true;
           break;
         }
@@ -2438,6 +2583,19 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         <div className="tool-strip">
           <div className="tool-group">
             <ToolButton
+              title={isSidebarOpen ? "Hide sidebar" : "Show sidebar"}
+              active={Boolean(pdfDoc) && isSidebarOpen}
+              disabled={!pdfDoc}
+              onClick={() => {
+                if (!pdfDoc) {
+                  return;
+                }
+                setIsSidebarOpen((prev) => !prev);
+              }}
+            >
+              <IconGlyph d="M4 5h16v14H4zM9 5v14" />
+            </ToolButton>
+            <ToolButton
               title="Re-parse document (refresh figure/reference mapping)"
               onClick={() => void (docId ? api.docParse(docId).then(setStats) : Promise.resolve())}
             >
@@ -2534,41 +2692,97 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         <div className="status">{statusText}</div>
       </div>
 
-      <div ref={readerRef} className="reader" onWheel={handleReaderWheel}>
-        {pdfDoc ? (
-          <div className="pages-column">
-            {pageNumbers.map((pageNumber) => (
-              <PdfPageSurface
-                key={pageNumber}
-                pdfDoc={pdfDoc}
-                scrollRootRef={readerRef}
-                pageNumber={pageNumber}
-                scale={scale}
-                toolMode={toolMode}
-                annotations={annotationsByPage.get(pageNumber) ?? []}
-                onActivate={setActivePage}
-                onCreateHighlight={createHighlight}
-                onCreateTextNote={createTextNote}
-                onCreateSticky={createSticky}
-                onManualBindRect={bindManualRect}
-                onSelectionMenu={handleSelectionMenuRequest}
-                selectionAction={selectionAction}
-                focusedNoteId={focusedNoteId}
-                onFocusNote={setFocusedNoteId}
-                selectedAnnotationIds={selectedAnnotationIds}
-                onSelectionChange={updateAnnotationSelection}
-                onMoveAnnotations={moveSelectedAnnotations}
-                onHighlightClick={handleHighlightClick}
-                onHighlightContextMenu={openHighlightMenuAt}
-                onAnnotationUpdate={updateAnnotation}
-                onAnnotationDelete={deleteAnnotation}
-                findRequest={findRequest}
-              />
-            ))}
-          </div>
-        ) : (
-          <div>Load a PDF file to start reading.</div>
-        )}
+      <div className={`reader-layout${pdfDoc && isSidebarOpen ? " has-sidebar" : ""}`}>
+        {pdfDoc && isSidebarOpen ? (
+          <aside className="reader-sidebar">
+            <div className="sidebar-head">
+              <button
+                type="button"
+                className={`sidebar-tab${sidebarTab === "thumbnails" ? " active" : ""}`}
+                onClick={() => setSidebarTab("thumbnails")}
+              >
+                Thumbnails
+              </button>
+              <button
+                type="button"
+                className={`sidebar-tab${sidebarTab === "outline" ? " active" : ""}`}
+                onClick={() => setSidebarTab("outline")}
+              >
+                Outline
+              </button>
+            </div>
+            <div className="sidebar-body">
+              {sidebarTab === "thumbnails" ? (
+                <div className="thumbnail-list">
+                  {pageNumbers.map((pageNumber) => (
+                    <SidebarThumbnailItem
+                      key={`thumb:${pageNumber}`}
+                      pageNumber={pageNumber}
+                      active={pageNumber === activePage}
+                      src={thumbnailUrls[pageNumber]}
+                      onVisible={() => void ensureThumbnail(pageNumber)}
+                      onClick={() => jumpToPage(pageNumber)}
+                    />
+                  ))}
+                </div>
+              ) : outlineNodes.length > 0 ? (
+                <div className="outline-list">
+                  {outlineNodes.map((node) => (
+                    <button
+                      key={node.id}
+                      type="button"
+                      className={`outline-item${node.page === activePage ? " active" : ""}`}
+                      style={{ paddingLeft: `${10 + Math.min(4, node.depth) * 14}px` }}
+                      title={`Page ${node.page}${node.source === "heuristic" ? " (heuristic)" : ""}`}
+                      onClick={() => jumpToPage(node.page)}
+                    >
+                      {node.title}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="sidebar-empty">No outline detected</div>
+              )}
+            </div>
+          </aside>
+        ) : null}
+
+        <div ref={readerRef} className="reader" onWheel={handleReaderWheel}>
+          {pdfDoc ? (
+            <div className="pages-column">
+              {pageNumbers.map((pageNumber) => (
+                <PdfPageSurface
+                  key={pageNumber}
+                  pdfDoc={pdfDoc}
+                  scrollRootRef={readerRef}
+                  pageNumber={pageNumber}
+                  scale={scale}
+                  toolMode={toolMode}
+                  annotations={annotationsByPage.get(pageNumber) ?? []}
+                  onActivate={setActivePage}
+                  onCreateHighlight={createHighlight}
+                  onCreateTextNote={createTextNote}
+                  onCreateSticky={createSticky}
+                  onManualBindRect={bindManualRect}
+                  onSelectionMenu={handleSelectionMenuRequest}
+                  selectionAction={selectionAction}
+                  focusedNoteId={focusedNoteId}
+                  onFocusNote={setFocusedNoteId}
+                  selectedAnnotationIds={selectedAnnotationIds}
+                  onSelectionChange={updateAnnotationSelection}
+                  onMoveAnnotations={moveSelectedAnnotations}
+                  onHighlightClick={handleHighlightClick}
+                  onHighlightContextMenu={openHighlightMenuAt}
+                  onAnnotationUpdate={updateAnnotation}
+                  onAnnotationDelete={deleteAnnotation}
+                  findRequest={findRequest}
+                />
+              ))}
+            </div>
+          ) : (
+            <div>Load a PDF file to start reading.</div>
+          )}
+        </div>
       </div>
 
       <div className="footer">
@@ -2747,6 +2961,63 @@ export function ReaderApp({ api }: { api: JournalApi }): JSX.Element {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function SidebarThumbnailItem({
+  pageNumber,
+  active,
+  src,
+  onVisible,
+  onClick,
+}: {
+  pageNumber: number;
+  active: boolean;
+  src?: string;
+  onVisible: () => void;
+  onClick: () => void;
+}): JSX.Element {
+  const itemRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (src) {
+      return;
+    }
+    const element = itemRef.current;
+    if (!element) {
+      return;
+    }
+    const root = element.closest(".sidebar-body");
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) {
+            continue;
+          }
+          onVisible();
+          observer.disconnect();
+          break;
+        }
+      },
+      {
+        root,
+        threshold: 0.12,
+      },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [onVisible, src, pageNumber]);
+
+  return (
+    <button
+      ref={itemRef}
+      type="button"
+      className={`thumbnail-item${active ? " active" : ""}`}
+      onClick={onClick}
+      title={`Page ${pageNumber}`}
+    >
+      <div className="thumbnail-page">Page {pageNumber}</div>
+      {src ? <img className="thumbnail-image" src={src} alt={`Page ${pageNumber}`} /> : <div className="thumbnail-placeholder">Loading...</div>}
+    </button>
   );
 }
 

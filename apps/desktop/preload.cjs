@@ -41,9 +41,10 @@ const api = {
     },
     docOpen: (path) => electron_1.ipcRenderer.invoke("doc.open", path),
     docParse: (docId) => electron_1.ipcRenderer.invoke("doc.parse", docId),
+    docGetOutline: (docId) => electron_1.ipcRenderer.invoke("doc.getOutline", docId),
     docReadBinary: (path) => electron_1.ipcRenderer.invoke("doc.readBinary", path),
     citationResolve: (docId, page, x, y) => electron_1.ipcRenderer.invoke("citation.resolve", docId, page, x, y),
-    citationResolveByLabel: (docId, kind, label) => electron_1.ipcRenderer.invoke("citation.resolveByLabel", docId, kind, label),
+    citationResolveByLabel: (docId, kind, label, familyHint) => electron_1.ipcRenderer.invoke("citation.resolveByLabel", docId, kind, label, familyHint),
     referenceResolve: (docId, page, x, y) => electron_1.ipcRenderer.invoke("reference.resolve", docId, page, x, y),
     referenceGetEntries: (docId, indices) => electron_1.ipcRenderer.invoke("reference.getEntries", docId, indices),
     referenceSearchByText: (docId, text, limit) => electron_1.ipcRenderer.invoke("reference.searchByText", docId, text, limit),
@@ -52,7 +53,7 @@ const api = {
     translateText: (payload) => electron_1.ipcRenderer.invoke("translate.text", payload),
     translateOpenPopup: (payload) => electron_1.ipcRenderer.invoke("translate.openPopup", payload),
     figureGetTarget: (docId, targetId) => electron_1.ipcRenderer.invoke("figure.getTarget", docId, targetId),
-    figureListTargets: (docId, kind, label) => electron_1.ipcRenderer.invoke("figure.listTargets", docId, kind, label),
+    figureListTargets: (docId, kind, label, familyHint) => electron_1.ipcRenderer.invoke("figure.listTargets", docId, kind, label, familyHint),
     figureOpenPopup: (payload) => electron_1.ipcRenderer.invoke("figure.openPopup", payload),
     recognizedOpenPopup: async (docId, kind) => {
         try {

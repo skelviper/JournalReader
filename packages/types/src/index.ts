@@ -1,4 +1,11 @@
 export type TargetKind = "figure" | "table" | "supplementary";
+export type RecognizedDisplayFamily =
+  | "figure"
+  | "table"
+  | "extended-data-figure"
+  | "extended-data-table"
+  | "supplementary-figure"
+  | "supplementary-table";
 
 export type Rect = {
   x: number;
@@ -23,6 +30,7 @@ export type VisualTarget = {
   kind: TargetKind;
   label: string;
   page: number;
+  captionPage?: number;
   cropRect: Rect;
   captionRect?: Rect;
   caption: string;
@@ -99,6 +107,7 @@ export type ResolveReferenceResponse = {
 
 export type FigureTargetResponse = {
   page: number;
+  captionPage?: number;
   cropRect: Rect;
   captionRect?: Rect;
   caption: string;
@@ -111,6 +120,7 @@ export type FigureTargetCandidate = {
   kind: TargetKind;
   label: string;
   page: number;
+  captionPage?: number;
   cropRect: Rect;
   captionRect?: Rect;
   caption: string;
@@ -129,6 +139,15 @@ export type FigurePopupPayload = {
   caption: string;
   pageImageDataUrl?: string;
   imageDataUrl: string;
+};
+
+export type OutlineNode = {
+  id: string;
+  title: string;
+  page: number;
+  depth: number;
+  source: "native" | "heuristic";
+  y?: number;
 };
 
 export type TranslateProvider = "google" | "libre" | "mymemory";
@@ -203,9 +222,15 @@ export type JournalApi = {
   onAnnotationChanged: (handler: (event: AnnotationChangedEvent) => void) => () => void;
   docOpen: (path: string) => Promise<OpenDocResponse>;
   docParse: (docId: string) => Promise<ParseDocResponse>;
+  docGetOutline: (docId: string) => Promise<OutlineNode[]>;
   docReadBinary: (path: string) => Promise<number[]>;
   citationResolve: (docId: string, page: number, x: number, y: number) => Promise<ResolveCitationResponse | null>;
-  citationResolveByLabel: (docId: string, kind: TargetKind, label: string) => Promise<ResolveCitationResponse | null>;
+  citationResolveByLabel: (
+    docId: string,
+    kind: TargetKind,
+    label: string,
+    familyHint?: RecognizedDisplayFamily,
+  ) => Promise<ResolveCitationResponse | null>;
   referenceResolve: (docId: string, page: number, x: number, y: number) => Promise<ResolveReferenceResponse | null>;
   referenceGetEntries: (docId: string, indices: number[]) => Promise<ReferenceEntry[]>;
   referenceSearchByText: (docId: string, text: string, limit?: number) => Promise<ReferenceEntry[]>;
@@ -214,7 +239,12 @@ export type JournalApi = {
   translateText: (payload: TranslateTextPayload) => Promise<TranslateTextResponse>;
   translateOpenPopup: (payload: TranslatePopupPayload) => Promise<void>;
   figureGetTarget: (docId: string, targetId: string) => Promise<FigureTargetResponse>;
-  figureListTargets: (docId: string, kind: TargetKind, label: string) => Promise<FigureTargetCandidate[]>;
+  figureListTargets: (
+    docId: string,
+    kind: TargetKind,
+    label: string,
+    familyHint?: RecognizedDisplayFamily,
+  ) => Promise<FigureTargetCandidate[]>;
   figureOpenPopup: (payload: FigurePopupPayload) => Promise<void>;
   recognizedOpenPopup: (docId: string, kind: RecognizedPopupKind) => Promise<boolean>;
   annotationCreate: (payload: CreateAnnotationPayload) => Promise<AnnotationItem>;
@@ -249,3 +279,60 @@ export type ParsedCaption = {
   layoutRect?: Rect;
   quality?: number;
 };
+
+export function normalizeTargetLabel(label: string): string {
+  return label.trim().toUpperCase();
+}
+
+export function baseTargetLabel(label: string): string {
+  const normalized = normalizeTargetLabel(label);
+  const match = normalized.match(/^(S?\d+)/);
+  return match ? match[1] : normalized;
+}
+
+export function isExtendedDataText(text: string | undefined): boolean {
+  return /^\s*extended\s+data\s+/i.test(text ?? "");
+}
+
+export function inferSupplementaryDisplayFamily(text: string | undefined): "figure" | "table" {
+  return /\btable\b/i.test(text ?? "") ? "table" : "figure";
+}
+
+export function inferRecognizedDisplayFamily(kind: TargetKind, text?: string): RecognizedDisplayFamily {
+  if (kind === "figure") {
+    return "figure";
+  }
+  if (kind === "table") {
+    return "table";
+  }
+  const subkind = inferSupplementaryDisplayFamily(text);
+  if (isExtendedDataText(text)) {
+    return subkind === "table" ? "extended-data-table" : "extended-data-figure";
+  }
+  return subkind === "table" ? "supplementary-table" : "supplementary-figure";
+}
+
+export function buildRecognizedDisplayLabel(kind: TargetKind, label: string, text?: string): string {
+  const base = baseTargetLabel(label);
+  const family = inferRecognizedDisplayFamily(kind, text);
+  if (family === "figure") {
+    return `Fig. ${base}`;
+  }
+  if (family === "table") {
+    return `Table ${base}`;
+  }
+  if (family === "extended-data-table") {
+    return `Extended Data Table ${base}`;
+  }
+  if (family === "extended-data-figure") {
+    return `Extended Data Fig. ${base}`;
+  }
+  if (family === "supplementary-table") {
+    return `Supplementary Table ${base}`;
+  }
+  return `Supplementary Fig. ${base}`;
+}
+
+export function buildRecognizedGroupKey(kind: TargetKind, label: string, text?: string): string {
+  return `${inferRecognizedDisplayFamily(kind, text)}:${baseTargetLabel(label)}`;
+}

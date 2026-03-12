@@ -31,6 +31,7 @@ export function ensureSchema(db: Database.Database): void {
       kind TEXT NOT NULL,
       label TEXT NOT NULL,
       page INTEGER NOT NULL,
+      caption_page INTEGER,
       crop_rect_json TEXT NOT NULL,
       caption_rect_json TEXT,
       caption TEXT NOT NULL,
@@ -91,5 +92,9 @@ export function ensureSchema(db: Database.Database): void {
   const hasCaptionRect = columns.some((col) => col.name === "caption_rect_json");
   if (!hasCaptionRect) {
     db.exec("ALTER TABLE visual_targets ADD COLUMN caption_rect_json TEXT");
+  }
+  const hasCaptionPage = columns.some((col) => col.name === "caption_page");
+  if (!hasCaptionPage) {
+    db.exec("ALTER TABLE visual_targets ADD COLUMN caption_page INTEGER");
   }
 }

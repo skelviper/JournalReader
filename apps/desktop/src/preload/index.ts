@@ -45,9 +45,11 @@ const api: JournalApi = {
   },
   docOpen: (path) => ipcRenderer.invoke("doc.open", path),
   docParse: (docId) => ipcRenderer.invoke("doc.parse", docId),
+  docGetOutline: (docId) => ipcRenderer.invoke("doc.getOutline", docId),
   docReadBinary: (path) => ipcRenderer.invoke("doc.readBinary", path),
   citationResolve: (docId, page, x, y) => ipcRenderer.invoke("citation.resolve", docId, page, x, y),
-  citationResolveByLabel: (docId, kind, label) => ipcRenderer.invoke("citation.resolveByLabel", docId, kind, label),
+  citationResolveByLabel: (docId, kind, label, familyHint) =>
+    ipcRenderer.invoke("citation.resolveByLabel", docId, kind, label, familyHint),
   referenceResolve: (docId, page, x, y) => ipcRenderer.invoke("reference.resolve", docId, page, x, y),
   referenceGetEntries: (docId, indices) => ipcRenderer.invoke("reference.getEntries", docId, indices),
   referenceSearchByText: (docId, text, limit) => ipcRenderer.invoke("reference.searchByText", docId, text, limit),
@@ -56,7 +58,8 @@ const api: JournalApi = {
   translateText: (payload) => ipcRenderer.invoke("translate.text", payload),
   translateOpenPopup: (payload) => ipcRenderer.invoke("translate.openPopup", payload),
   figureGetTarget: (docId, targetId) => ipcRenderer.invoke("figure.getTarget", docId, targetId),
-  figureListTargets: (docId, kind, label) => ipcRenderer.invoke("figure.listTargets", docId, kind, label),
+  figureListTargets: (docId, kind, label, familyHint) =>
+    ipcRenderer.invoke("figure.listTargets", docId, kind, label, familyHint),
   figureOpenPopup: (payload) => ipcRenderer.invoke("figure.openPopup", payload),
   recognizedOpenPopup: async (docId, kind) => {
     try {

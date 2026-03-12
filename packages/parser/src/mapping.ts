@@ -92,6 +92,7 @@ export function mapCitationsToTargets(
       kind: caption.kind,
       label: caption.label,
       page: caption.page,
+      captionPage: caption.page,
       cropRect: caption.layoutRect ?? guessCropRect(caption.bbox, caption.kind),
       captionRect: caption.bbox,
       caption: caption.caption,
